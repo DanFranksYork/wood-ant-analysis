@@ -66,7 +66,7 @@ show_figure <- artwork$show
 
 # Pre-processing changes
 
-## Bug 1: Trail investment and pair-specific normalisation
+## Trail investment and pair-specific normalisation
 
 The original calculation was:
 
@@ -75,7 +75,7 @@ trail_investment = (strength * distance_fine_scale) /
   mean(c(from_nest_size, from_nest_size), na.rm = T)
 ~~~
 
-This has a bug in that it uses 'from_nest_size' twice, where it should be c(from_nest_size, to_nest_size).
+This uses 'from_nest_size' twice, where it should be c(from_nest_size, to_nest_size).
 
 Additionally, I changed the normalisation from a common denominator to the mean population of each pair of connected nests. I believe this is what we really want. Let me know if it's not. This pair-specific mean expresses trail allocation relative to the workforce of the connected nests, rather than simply rescaling all trails by one constant.
 
@@ -99,7 +99,7 @@ trail_investment = dplyr::if_else(
 ~~~
 
 
-## Bug 2: Genotypes: combine the two allele columns into one diploid locus
+## Genotypes: combine the two allele columns into one diploid locus
 
 The original conversion passed the allele columns directly to `df2genind()`:
 

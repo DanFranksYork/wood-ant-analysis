@@ -15,9 +15,9 @@ process_wood_ant_data <- function(input_file) {
   assert_unique <- function(x, columns, description) {
     if (anyDuplicated(x[columns])) stop("Duplicate identifiers: ", description)
   }
-  pair_key <- function(a, b) {
-    paste(pmin(as.integer(a), as.integer(b)),
-      pmax(as.integer(a), as.integer(b)),
+  pair_key <- function(first_nest, second_nest) {
+    paste(pmin(as.integer(first_nest), as.integer(second_nest)),
+      pmax(as.integer(first_nest), as.integer(second_nest)),
       sep = "_"
     )
   }
@@ -53,15 +53,15 @@ process_wood_ant_data <- function(input_file) {
     }, logical(1)))
   )
   locus_audit <- dplyr::bind_rows(lapply(loci, function(locus) {
-    a <- microsat_raw[[paste0(locus, "_1")]]
-    b <- microsat_raw[[paste0(locus, "_2")]]
+    first_allele <- microsat_raw[[paste0(locus, "_1")]]
+    second_allele <- microsat_raw[[paste0(locus, "_2")]]
     tibble::tibble(
-      locus = locus, diploid_samples = length(a),
-      zero_pairs = sum(a == "000" & b == "000", na.rm = TRUE),
-      half_zero_pairs = sum(xor(a == "000", b == "000"), na.rm = TRUE),
-      other_missing_pairs = sum(is.na(a) | is.na(b)),
-      nonzero_alleles = length(setdiff(unique(c(a, b)), c("000", NA_character_))),
-      allele_values = paste(sort(unique(c(a, b))), collapse = ", ")
+      locus = locus, diploid_samples = length(first_allele),
+      zero_pairs = sum(first_allele == "000" & second_allele == "000", na.rm = TRUE),
+      half_zero_pairs = sum(xor(first_allele == "000", second_allele == "000"), na.rm = TRUE),
+      other_missing_pairs = sum(is.na(first_allele) | is.na(second_allele)),
+      nonzero_alleles = length(setdiff(unique(c(first_allele, second_allele)), c("000", NA_character_))),
+      allele_values = paste(sort(unique(c(first_allele, second_allele))), collapse = ", ")
     )
   }))
 
@@ -77,7 +77,9 @@ process_wood_ant_data <- function(input_file) {
       has_genotypes = label %in% as.character(microsat_raw$label),
       valid_size = is.finite(nest_size) & nest_size > 0,
       valid_gps = is.finite(lat) & is.finite(lon) & abs(lat) <= 90 & abs(lon) <= 180,
-      coordinate_proxy = label %in% c("129", "190")
+      # 2026-10-23: N47 reoccupies its recorded location; N49 is corrected in the workbook.
+      # Both local-coordinate queries are resolved (see Data_cleaning_notes_SP).
+      coordinate_proxy = FALSE
     )
   assert_unique(dplyr::filter(nests, !is.na(nest_key)), "nest_key", "colony and nest ID")
   stopifnot(
@@ -179,7 +181,7 @@ process_wood_ant_data <- function(input_file) {
   dyads <- tibble::tibble(from_label = pair_index[, 1L], to_label = pair_index[, 2L]) |>
     dplyr::mutate(pair_id = pair_key(from_label, to_label))
   endpoint_variables <- c(
-    "colony", "ID", "nest_size", "valid_size", "valid_gps", "lat", "lon",
+    "colony", "ID", "nest_size", "valid_size", "valid_gps", "lat", "lon", "nest_x", "nest_y",
     "foraging_income", "foraging_status", "coordinate_proxy"
   )
   for (endpoint in c("from", "to")) {
@@ -212,9 +214,15 @@ process_wood_ant_data <- function(input_file) {
         trail_status == "observed_present" ~ TRUE,
         trail_status == "confirmed_absent" ~ FALSE, TRUE ~ NA
       ),
-      distGeo_m = geographic_distance(from_lon, from_lat, to_lon, to_lat,
+      gps_distance_m = geographic_distance(from_lon, from_lat, to_lon, to_lat,
         from_valid_gps & to_valid_gps
       ),
+      # Local maps have separate origins: use their coordinates only within colonies.
+      local_distance_m = dplyr::if_else(same_colony %in% TRUE,
+        sqrt((from_nest_x - to_nest_x)^2 + (from_nest_y - to_nest_y)^2) / 100,
+        NA_real_
+      ),
+      distance_m = dplyr::if_else(same_colony %in% TRUE, local_distance_m, gps_distance_m),
       mean_endpoint_size = dplyr::if_else(from_valid_size & to_valid_size,
         (from_nest_size + to_nest_size) / 2, NA_real_
       ),
@@ -245,25 +253,30 @@ process_wood_ant_data <- function(input_file) {
         (dyads$to_nest_size + dyads$from_nest_size) / 2, NA_real_
       )
     )),
-    isTRUE(all.equal(dyads$distGeo_m,
+    isTRUE(all.equal(dyads$gps_distance_m,
       geographic_distance(
         dyads$to_lon, dyads$to_lat, dyads$from_lon, dyads$from_lat,
         dyads$from_valid_gps & dyads$to_valid_gps
       ),
       tolerance = 1e-8
+    )),
+    isTRUE(all.equal(dyads$local_distance_m,
+      ifelse(dyads$same_colony %in% TRUE,
+        sqrt((dyads$to_nest_x - dyads$from_nest_x)^2 +
+          (dyads$to_nest_y - dyads$from_nest_y)^2) / 100, NA_real_)
     ))
   )
 
   # 4. Diploid genotypes and FST for all three models -----------------------------
   make_diploid <- function(swap = FALSE) {
     result <- lapply(loci, function(locus) {
-      a <- microsat_raw[[paste0(locus, if (swap) "_2" else "_1")]]
-      b <- microsat_raw[[paste0(locus, if (swap) "_1" else "_2")]]
+      first_allele <- microsat_raw[[paste0(locus, if (swap) "_2" else "_1")]]
+      second_allele <- microsat_raw[[paste0(locus, if (swap) "_1" else "_2")]]
       # Confirmed for this workbook: 000 denotes a failed allele call.
-      a[a == "000"] <- NA_character_
-      b[b == "000"] <- NA_character_
-      dplyr::if_else(is.na(a) | is.na(b), NA_character_,
-        paste0("A", a, "/A", b)
+      first_allele[first_allele == "000"] <- NA_character_
+      second_allele[second_allele == "000"] <- NA_character_
+      dplyr::if_else(is.na(first_allele) | is.na(second_allele), NA_character_,
+        paste0("A", first_allele, "/A", second_allele)
       )
     })
     names(result) <- loci
@@ -289,8 +302,19 @@ process_wood_ant_data <- function(input_file) {
     )
   }
   genotype <- to_genind(diploid_calls)
+  sample_metadata <- data.frame(
+    sample_id = microsat_raw$microsat_sample_ID,
+    label = as.character(microsat_raw$label), stringsAsFactors = FALSE
+  )
+  nest_match <- match(sample_metadata$label, nests$label)
+  sample_metadata$colony <- nests$colony[nest_match]
+  sample_metadata$nest_id <- nests$ID[nest_match]
+  sample_metadata <- sample_metadata[match(adegenet::indNames(genotype),
+    sample_metadata$sample_id), , drop = FALSE]
+  stopifnot(identical(sample_metadata$sample_id, adegenet::indNames(genotype)))
+  adegenet::strata(genotype) <- sample_metadata
   genotype_swapped <- to_genind(make_diploid(swap = TRUE))
-  allele_table <- function(g) adegenet::tab(g)[, sort(colnames(adegenet::tab(g))), drop = FALSE]
+  allele_table <- function(genotype_subset) adegenet::tab(genotype_subset)[, sort(colnames(adegenet::tab(genotype_subset))), drop = FALSE]
   stopifnot(
     adegenet::nLoc(genotype) == 11L,
     identical(adegenet::locNames(genotype), loci),
@@ -307,48 +331,81 @@ process_wood_ant_data <- function(input_file) {
   locus_audit$typed_diploid_calls <- colSums(!is.na(diploid_calls))
 
   # Alphabetic allele labels force positive integer recoding in hierfstat.
-  hf_data <- hierfstat::genind2hierfstat(genotype)
-  hf_swap <- hierfstat::genind2hierfstat(genotype_swapped)
+  hierfstat_data <- hierfstat::genind2hierfstat(genotype)
+  swapped_hierfstat_data <- hierfstat::genind2hierfstat(genotype_swapped)
   # Integer encodings may reverse the two allele blocks without changing the genotype.
-  stopifnot(isTRUE(all.equal(hierfstat::pop.freq(hf_data),
-    hierfstat::pop.freq(hf_swap),
+  stopifnot(isTRUE(all.equal(hierfstat::pop.freq(hierfstat_data),
+    hierfstat::pop.freq(swapped_hierfstat_data),
     check.attributes = FALSE
   )))
-  expected_populations <- sort(unique(as.character(microsat_raw$label[keep_ant])))
-  methods <- c(FST_Latter = "Fst", FST_WC84 = "WC84", FST_Nei = "Nei87")
-  fst_matrices <- lapply(methods, function(method) {
-    m <- as.matrix(hierfstat::genet.dist(hf_data, diploid = TRUE, method = method))
-    stopifnot(
-      identical(rownames(m), colnames(m)),
-      setequal(rownames(m), expected_populations),
-      isTRUE(all.equal(m, t(m), tolerance = 1e-12)),
-      all(diag(m) == 0)
-    )
-    m
-  })
+  fst_matrices <- calculate_fst_matrices(genotype)
 
   # Reversing individual order cannot change the population-labelled Latter matrix.
-  hf_reversed <- hf_data[rev(seq_len(nrow(hf_data))), , drop = FALSE]
-  reverse_latter <- as.matrix(hierfstat::genet.dist(hf_reversed, method = "Fst"))
+  reversed_hierfstat_data <- hierfstat_data[rev(seq_len(nrow(hierfstat_data))), , drop = FALSE]
+  reverse_latter <- as.matrix(hierfstat::genet.dist(reversed_hierfstat_data, method = "Fst"))
   original_latter <- fst_matrices$FST_Latter
   stopifnot(isTRUE(all.equal(original_latter,
     reverse_latter[rownames(original_latter), colnames(original_latter)],
     tolerance = 1e-12
   )))
+  genetic_data <- attach_fst_estimates(dyads, fst_matrices)
+  dyads <- genetic_data$dyads
+
+  # 5. Model-specific samples and exclusions -------------------------------------
+  samples <- select_analysis_samples(dyads)
+  analysis_data <- samples$analysis_data
+
+  coordinate_audit <- tibble::tibble(
+    analysis = "m2b",
+    retained_trails = nrow(analysis_data$m2b),
+    trails_with_proxy_coordinates = sum(analysis_data$m2b$coordinate_proxy)
+  )
+
+  # 6. Analysis data and the audit tables used in the notebook --------------------
+  list(
+    analysis_data = analysis_data, dyads = dyads, nests = nests,
+    sample_sizes = samples$sample_sizes, sample_counts = sample_counts,
+    exclusions = samples$exclusions,
+    exclusion_rows = samples$exclusion_rows, locus_audit = locus_audit,
+    genotype_exclusions = genotype_exclusions, coordinate_audit = coordinate_audit,
+    trail_mapping_issues = trail_mapping_issues, fst_support = genetic_data$fst_support,
+    fst_agreement = genetic_data$fst_agreement, workbook_md5 = unname(tools::md5sum(input_file)),
+    genotypes = genotype
+  )
+}
+
+# Used to recalculate FST after the shared genetic screen.
+calculate_fst_matrices <- function(genotypes) {
+  expected_populations <- unique(as.character(adegenet::pop(genotypes)))
+  hierfstat_data <- hierfstat::genind2hierfstat(genotypes)
+  methods <- c(FST_Latter = "Fst", FST_WC84 = "WC84", FST_Nei = "Nei87")
+  lapply(methods, function(method) {
+    fst_matrix <- as.matrix(hierfstat::genet.dist(hierfstat_data, diploid = TRUE, method = method))
+    stopifnot(
+      identical(rownames(fst_matrix), colnames(fst_matrix)),
+      setequal(rownames(fst_matrix), expected_populations),
+      isTRUE(all.equal(fst_matrix, t(fst_matrix), tolerance = 1e-12)),
+      all(diag(fst_matrix) == 0)
+    )
+    fst_matrix
+  })
+}
+
+attach_fst_estimates <- function(dyads, fst_matrices) {
   for (name in names(fst_matrices)) {
-    m <- fst_matrices[[name]]
-    row_id <- match(dyads$from_label, rownames(m))
-    col_id <- match(dyads$to_label, colnames(m))
-    dyads[[name]] <- m[cbind(row_id, col_id)]
-    stopifnot(isTRUE(all.equal(dyads[[name]], m[cbind(col_id, row_id)], tolerance = 1e-12)))
+    fst_matrix <- fst_matrices[[name]]
+    row_id <- match(dyads$from_label, rownames(fst_matrix))
+    col_id <- match(dyads$to_label, colnames(fst_matrix))
+    dyads[[name]] <- fst_matrix[cbind(row_id, col_id)]
+    stopifnot(isTRUE(all.equal(dyads[[name]], fst_matrix[cbind(col_id, row_id)], tolerance = 1e-12)))
   }
-  fst_support <- dplyr::bind_rows(lapply(names(methods), function(name) {
-    x <- dyads[[name]]
+  fst_support <- dplyr::bind_rows(lapply(names(fst_matrices), function(name) {
+    fst_values <- dyads[[name]]
     tibble::tibble(
-      estimator = name, pairs = length(x), finite = sum(is.finite(x)),
-      missing_or_nonfinite = sum(!is.finite(x)), negative = sum(x < 0, na.rm = TRUE),
-      zero = sum(x == 0, na.rm = TRUE), one_or_above = sum(x >= 1, na.rm = TRUE),
-      minimum = min(x, na.rm = TRUE), median = median(x, na.rm = TRUE), maximum = max(x, na.rm = TRUE)
+      estimator = name, pairs = length(fst_values), finite = sum(is.finite(fst_values)),
+      missing_or_nonfinite = sum(!is.finite(fst_values)), negative = sum(fst_values < 0, na.rm = TRUE),
+      zero = sum(fst_values == 0, na.rm = TRUE), one_or_above = sum(fst_values >= 1, na.rm = TRUE),
+      minimum = min(fst_values, na.rm = TRUE), median = median(fst_values, na.rm = TRUE), maximum = max(fst_values, na.rm = TRUE)
     )
   }))
   fst_agreement <- dplyr::bind_rows(lapply(c("FST_WC84", "FST_Nei"), function(other) {
@@ -358,34 +415,36 @@ process_wood_ant_data <- function(input_file) {
         within = !is.na(dyads$same_colony) & dyads$same_colony,
         between = !is.na(dyads$same_colony) & !dyads$same_colony
       )
-      ok <- take & is.finite(dyads$FST_Latter) & is.finite(dyads[[other]])
-      a <- dyads$FST_Latter[ok]
-      b <- dyads[[other]][ok]
+      comparable_pairs <- take & is.finite(dyads$FST_Latter) & is.finite(dyads[[other]])
+      latter_fst <- dyads$FST_Latter[comparable_pairs]
+      alternative_fst <- dyads[[other]][comparable_pairs]
       tibble::tibble(
-        estimator = other, pair_group = group, pairs = sum(ok),
-        pearson = stats::cor(a, b), spearman = stats::cor(a, b, method = "spearman"),
-        mean_difference = mean(b - a), median_absolute_difference = median(abs(b - a)),
-        largest_absolute_difference = max(abs(b - a)),
-        opposite_sign = sum(a * b < 0)
+        estimator = other, pair_group = group, pairs = sum(comparable_pairs),
+        pearson = stats::cor(latter_fst, alternative_fst), spearman = stats::cor(latter_fst, alternative_fst, method = "spearman"),
+        mean_difference = mean(alternative_fst - latter_fst), median_absolute_difference = median(abs(alternative_fst - latter_fst)),
+        largest_absolute_difference = max(abs(alternative_fst - latter_fst)),
+        opposite_sign = sum(latter_fst * alternative_fst < 0)
       )
     }))
   }))
+  list(dyads = dyads, fst_support = fst_support, fst_agreement = fst_agreement)
+}
 
-  # 5. Model-specific samples and exclusions -------------------------------------
+select_analysis_samples <- function(dyads) {
   # Reasons can overlap; the per-analysis sample table counts each pair once.
   analysis_masks <- list(
     # Model 1: genetic differentiation among pairs with known colonies.
     m1 = list(
       unknown_colony = !dyads$known_colony_pair,
       missing_genetic_estimate = !is.finite(dyads$FST_Latter),
-      invalid_geography = !is.finite(dyads$distGeo_m)
+      invalid_geography = !is.finite(dyads$distance_m)
     ),
     # Model 2: trail presence among eligible within-colony pairs.
     m2 = list(
       not_known_within_colony = is.na(dyads$same_colony) | !dyads$same_colony,
       unknown_trail_status = is.na(dyads$connected),
       missing_genetic_estimate = !is.finite(dyads$FST_Latter),
-      invalid_geography = !is.finite(dyads$distGeo_m),
+      invalid_geography = !is.finite(dyads$distance_m),
       unknown_food_difference = !is.finite(dyads$food_difference)
     ),
     # Model 3: positive investment among observed within-colony trails.
@@ -393,7 +452,7 @@ process_wood_ant_data <- function(input_file) {
       not_known_within_colony = is.na(dyads$same_colony) | !dyads$same_colony,
       no_observed_trail = !dyads$listed_trail,
       missing_genetic_estimate = !is.finite(dyads$FST_Latter),
-      invalid_geography = !is.finite(dyads$distGeo_m),
+      invalid_geography = !is.finite(dyads$distance_m),
       unknown_food_difference = !is.finite(dyads$food_difference),
       missing_or_nonpositive_endpoint_size = !dyads$from_valid_size | !dyads$to_valid_size,
       invalid_positive_investment = !is.finite(dyads$trail_investment) | dyads$trail_investment <= 0
@@ -410,7 +469,7 @@ process_wood_ant_data <- function(input_file) {
     dyads[!excluded, , drop = FALSE]
   })
   sample_sizes <- dplyr::bind_rows(lapply(names(analysis_data), function(analysis) {
-    x <- analysis_data[[analysis]]
+    selected_pairs <- analysis_data[[analysis]]
     design_pairs <- switch(analysis,
       m1 = sum(dyads$known_colony_pair),
       m2 = sum(dyads$same_colony, na.rm = TRUE),
@@ -419,31 +478,20 @@ process_wood_ant_data <- function(input_file) {
     tibble::tibble(
       analysis = analysis, candidate_pairs = nrow(dyads),
       design_eligible_pairs = design_pairs,
-      included_pairs = nrow(x), excluded_pairs = nrow(dyads) - nrow(x),
-      measurement_exclusions = design_pairs - nrow(x),
-      nests = dplyr::n_distinct(c(x$from_label, x$to_label)),
-      known_colonies = dplyr::n_distinct(c(x$from_colony, x$to_colony), na.rm = TRUE),
-      observed_trails = sum(x$listed_trail),
-      within_pairs = sum(x$same_colony, na.rm = TRUE),
-      between_pairs = sum(!x$same_colony, na.rm = TRUE),
-      unknown_colony_pairs = sum(is.na(x$same_colony))
+      included_pairs = nrow(selected_pairs), excluded_pairs = nrow(dyads) - nrow(selected_pairs),
+      measurement_exclusions = design_pairs - nrow(selected_pairs),
+      nests = dplyr::n_distinct(c(selected_pairs$from_label, selected_pairs$to_label)),
+      known_colonies = dplyr::n_distinct(c(selected_pairs$from_colony, selected_pairs$to_colony), na.rm = TRUE),
+      observed_trails = sum(selected_pairs$listed_trail),
+      within_pairs = sum(selected_pairs$same_colony, na.rm = TRUE),
+      between_pairs = sum(!selected_pairs$same_colony, na.rm = TRUE),
+      unknown_colony_pairs = sum(is.na(selected_pairs$same_colony))
     )
   }))
 
-  coordinate_audit <- tibble::tibble(
-    analysis = "m2b",
-    retained_trails = nrow(analysis_data$m2b),
-    trails_with_proxy_coordinates = sum(analysis_data$m2b$coordinate_proxy)
-  )
-
-  # 6. Analysis data and the audit tables used in the notebook --------------------
   list(
-    analysis_data = analysis_data, dyads = dyads, nests = nests,
-    sample_sizes = sample_sizes, sample_counts = sample_counts,
+    analysis_data = analysis_data, sample_sizes = sample_sizes,
     exclusions = dplyr::count(analysis_exclusions, analysis, reason, name = "excluded_pairs"),
-    exclusion_rows = analysis_exclusions, locus_audit = locus_audit,
-    genotype_exclusions = genotype_exclusions, coordinate_audit = coordinate_audit,
-    trail_mapping_issues = trail_mapping_issues, fst_support = fst_support,
-    fst_agreement = fst_agreement, workbook_md5 = unname(tools::md5sum(input_file))
+    exclusion_rows = analysis_exclusions
   )
 }

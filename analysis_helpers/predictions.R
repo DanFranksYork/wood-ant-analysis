@@ -8,20 +8,20 @@
 # normal_quadrature() is also used by prior_checks.R.
 # Tables and curves use posterior means and 95% equal-tailed credible intervals.
 
-summarize_columns <- function(x) {
+summarize_columns <- function(draw_matrix) {
   tibble(
-    estimate = apply(x, 2, mean),
-    lower = apply(x, 2, quantile, .025), upper = apply(x, 2, quantile, .975)
+    estimate = apply(draw_matrix, 2, mean),
+    lower = apply(draw_matrix, 2, quantile, .025), upper = apply(draw_matrix, 2, quantile, .975)
   )
 }
 
 # Nodes and weights integrate over a standard normal variable.
 normal_quadrature <- function(n = 30) {
-  j <- matrix(0, n, n)
-  j[cbind(1:(n - 1), 2:n)] <- sqrt(1:(n - 1))
-  j <- j + t(j)
-  e <- eigen(j, symmetric = TRUE)
-  list(nodes = e$values, weights = e$vectors[1, ]^2)
+  jacobi_matrix <- matrix(0, n, n)
+  jacobi_matrix[cbind(1:(n - 1), 2:n)] <- sqrt(1:(n - 1))
+  jacobi_matrix <- jacobi_matrix + t(jacobi_matrix)
+  eigendecomposition <- eigen(jacobi_matrix, symmetric = TRUE)
+  list(nodes = eigendecomposition$values, weights = eigendecomposition$vectors[1, ]^2)
 }
 
 # Shared expected-response prediction -----------------------------------------
@@ -29,23 +29,23 @@ normal_quadrature <- function(n = 30) {
 # Model 1 integrates over Gaussian residual variation before averaging FST.
 # Models 2 and 3 use brms expected responses, including the lognormal mean correction.
 
-expected_response <- function(fit, s, newdata, ids, re_formula = NULL) {
-  if (s$response_scale != "logit") {
-    return(posterior_epred(fit, newdata = newdata, re_formula = re_formula, draw_ids = ids))
+expected_response <- function(fit, model_spec, newdata, draw_ids, re_formula = NULL) {
+  if (model_spec$response_scale != "logit") {
+    return(posterior_epred(fit, newdata = newdata, re_formula = re_formula, draw_ids = draw_ids))
   }
-  mu <- posterior_linpred(fit, newdata = newdata, re_formula = re_formula, draw_ids = ids)
-  sigma <- posterior_linpred(fit,
+  logit_mean_draws <- posterior_linpred(fit, newdata = newdata, re_formula = re_formula, draw_ids = draw_ids)
+  logit_sd_draws <- posterior_linpred(fit,
     newdata = newdata, dpar = "sigma", transform = TRUE,
-    re_formula = re_formula, draw_ids = ids
+    re_formula = re_formula, draw_ids = draw_ids
   )
-  mean_fst(mu, sigma)
+  mean_fst(logit_mean_draws, logit_sd_draws)
 }
 
-mean_fst <- function(mu, sigma) {
-  quad <- normal_quadrature()
-  mean_response <- matrix(0, nrow(mu), ncol(mu))
-  for (k in seq_along(quad$nodes)) {
-    mean_response <- mean_response + quad$weights[k] * plogis(mu + sigma * quad$nodes[k])
+mean_fst <- function(logit_mean_draws, logit_sd_draws) {
+  quadrature <- normal_quadrature()
+  mean_response <- matrix(0, nrow(logit_mean_draws), ncol(logit_mean_draws))
+  for (k in seq_along(quadrature$nodes)) {
+    mean_response <- mean_response + quadrature$weights[k] * plogis(logit_mean_draws + logit_sd_draws * quadrature$nodes[k])
   }
   mean_response
 }
@@ -53,11 +53,11 @@ mean_fst <- function(mu, sigma) {
 # Model 1: genetic differentiation calculations -------------------------------
 
 check_prediction_integration <- function() {
-  quad <- normal_quadrature()
+  quadrature <- normal_quadrature()
   # Check the expected FST against an independent adaptive integral.
   grid <- expand.grid(mu = c(-4, -2, -.5), sigma = c(.1, .3, .6, 1))
   error <- apply(grid, 1, function(g) {
-    numerical <- sum(quad$weights * plogis(g[1] + g[2] * quad$nodes))
+    numerical <- sum(quadrature$weights * plogis(g[1] + g[2] * quadrature$nodes))
     reference <- integrate(function(z) plogis(g[1] + g[2] * z) * dnorm(z),
       -Inf, Inf, rel.tol = 1e-10)$value
     abs(numerical - reference)
@@ -67,88 +67,90 @@ check_prediction_integration <- function() {
 }
 
 # Change distance without re-centring the fitted colony-pair slopes or changing endpoints.
-shift_genetic_distance <- function(d, increase) {
-  d$distGeo_m <- d$distGeo_m + increase
-  d$distance_100m <- (d$distGeo_m - 50) / 100
-  d$distance_between <- d$distance_100m * (1 - d$same_colony)
-  d$distance_within <- d$distance_100m * d$same_colony
-  d$pair_distance_between <- (d$distGeo_m - d$pair_mean_distance_m) / 100 * (1 - d$same_colony)
-  d
+shift_genetic_distance <- function(model_data, increase) {
+  model_data$distance_m <- model_data$distance_m + increase
+  model_data$distance_100m <- (model_data$distance_m - 50) / 100
+  model_data$distance_between <- model_data$distance_100m * (1 - model_data$same_colony)
+  model_data$distance_within <- model_data$distance_100m * model_data$same_colony
+  model_data$pair_distance_between <- (model_data$distance_m - model_data$pair_mean_distance_m) / 100 * (1 - model_data$same_colony)
+  model_data
 }
 
 # Sum expected FST and local distance slopes in batches over all observed pairs.
 # The notebook divides these draw-wise sums by category counts and forms contrasts.
-genetic_row_sums <- function(fit, spec, step = .01, ids = seq_len(ndraws(fit)), re_formula = NULL) {
-  d <- spec$data
-  stopifnot(length(step) == 1, is.finite(step), step > 0, all(d$distGeo_m > step))
-  group <- ifelse(d$same_colony == 1, "Within colony", "Between colonies")
+genetic_row_sums <- function(fit, model_spec, derivative_step = .01, draw_ids = seq_len(ndraws(fit)), re_formula = NULL) {
+  model_data <- model_spec$data
+  stopifnot(length(derivative_step) == 1, is.finite(derivative_step), derivative_step > 0, all(model_data$distance_m > derivative_step))
+  group <- ifelse(model_data$same_colony == 1, "Within colony", "Between colonies")
   groups <- c("Within colony", "Between colonies")
-  slopes <- matrix(0, length(ids), length(groups), dimnames = list(NULL, groups))
-  levels <- slopes
+  slope_sums <- matrix(0, length(draw_ids), length(groups), dimnames = list(NULL, groups))
+  mean_response_sums <- slope_sums
   # Every fitted row is used. The small step approximates a derivative,
   # not a finite distance contrast; halving it was checked for numerical stability.
-  batches <- split(seq_len(nrow(d)), ceiling(seq_len(nrow(d)) / 1000))
+  batches <- split(seq_len(nrow(model_data)), ceiling(seq_len(nrow(model_data)) / 1000))
   for (ix in batches) {
-    new <- d[ix, , drop = FALSE]
-    ep <- expected_response(fit, spec, new, re_formula = re_formula, ids = ids)
-    low <- expected_response(fit, spec, shift_genetic_distance(new, -step), re_formula = re_formula, ids = ids)
-    high <- expected_response(fit, spec, shift_genetic_distance(new, step), re_formula = re_formula, ids = ids)
-    local <- (high - low) / (2 * step)
+    prediction_data <- model_data[ix, , drop = FALSE]
+    expected_draws <- expected_response(fit, model_spec, prediction_data, re_formula = re_formula, draw_ids = draw_ids)
+    lower_predictions <- expected_response(fit, model_spec,
+      shift_genetic_distance(prediction_data, -derivative_step), re_formula = re_formula, draw_ids = draw_ids)
+    upper_predictions <- expected_response(fit, model_spec,
+      shift_genetic_distance(prediction_data, derivative_step), re_formula = re_formula, draw_ids = draw_ids)
+    local_slopes <- (upper_predictions - lower_predictions) / (2 * derivative_step)
     for (g in groups) {
       selected <- group[ix] == g
       if (any(selected)) {
-        slopes[, g] <- slopes[, g] + rowSums(local[, selected, drop = FALSE])
-        levels[, g] <- levels[, g] + rowSums(ep[, selected, drop = FALSE])
+        slope_sums[, g] <- slope_sums[, g] + rowSums(local_slopes[, selected, drop = FALSE])
+        mean_response_sums[, g] <- mean_response_sums[, g] + rowSums(expected_draws[, selected, drop = FALSE])
       }
     }
   }
-  list(level_sums = levels, slope_sums = slopes)
+  list(level_sums = mean_response_sums, slope_sums = slope_sums)
 }
 
 # Models 2 and 3: shared trail calculations -----------------------------------
 
 # Repeat all pairs at each grid value, keeping their other predictors unchanged.
-trail_prediction_data <- function(d, transformations, variable, values) {
-  ss <- transformations[match(variable, transformations$variable), ]
-  target <- c(distGeo_m = "distance_z", FST_Latter = "fst_z", food_difference = "food_z")[[variable]]
-  new <- d[rep(seq_len(nrow(d)), times = length(values)), , drop = FALSE]
-  new[[variable]] <- rep(values, each = nrow(d))
-  new[[target]] <- (new[[variable]] - ss$center) / ss$scale
-  new
+trail_prediction_data <- function(model_data, trail_transformations, variable, values) {
+  predictor_scaling <- trail_transformations[match(variable, trail_transformations$variable), ]
+  standardized_column <- c(distance_m = "distance_z", FST_Latter = "fst_z", food_difference = "food_z")[[variable]]
+  prediction_data <- model_data[rep(seq_len(nrow(model_data)), times = length(values)), , drop = FALSE]
+  prediction_data[[variable]] <- rep(values, each = nrow(model_data))
+  prediction_data[[standardized_column]] <- (prediction_data[[variable]] - predictor_scaling$center) / predictor_scaling$scale
+  prediction_data
 }
 
 # Local slopes at every observed row, retaining the other predictors and fitted groups.
-trail_local_slopes <- function(fit, spec, transformations, variable, step, ids = seq_len(ndraws(fit))) {
-  stopifnot(length(step) == 1L, is.finite(step), step > 0)
-  d <- spec$data
-  ss <- transformations[match(variable, transformations$variable), ]
-  target <- c(distGeo_m = "distance_z", FST_Latter = "fst_z", food_difference = "food_z")[[variable]]
-  column <- if (variable == "FST_Latter" && endsWith(spec$name, "_WC84")) "FST_WC84" else variable
-  stopifnot(all(is.finite(d[[column]])), is.finite(ss$scale), ss$scale > 0)
+trail_local_slopes <- function(fit, model_spec, trail_transformations, variable, derivative_step, draw_ids = seq_len(ndraws(fit))) {
+  stopifnot(length(derivative_step) == 1L, is.finite(derivative_step), derivative_step > 0)
+  model_data <- model_spec$data
+  predictor_scaling <- trail_transformations[match(variable, trail_transformations$variable), ]
+  standardized_column <- c(distance_m = "distance_z", FST_Latter = "fst_z", food_difference = "food_z")[[variable]]
+  raw_column <- if (variable == "FST_Latter" && endsWith(model_spec$name, "_WC84")) "FST_WC84" else variable
+  stopifnot(all(is.finite(model_data[[raw_column]])), is.finite(predictor_scaling$scale), predictor_scaling$scale > 0)
   predict_at <- function(rows, shift) {
-    new <- d[rows, , drop = FALSE]
-    new[[column]] <- new[[column]] + shift
-    new[[target]] <- (new[[column]] - ss$center) / ss$scale
-    expected_response(fit, spec, new, re_formula = NULL, ids = ids)
+    prediction_data <- model_data[rows, , drop = FALSE]
+    prediction_data[[raw_column]] <- prediction_data[[raw_column]] + shift
+    prediction_data[[standardized_column]] <- (prediction_data[[raw_column]] - predictor_scaling$center) / predictor_scaling$scale
+    expected_response(fit, model_spec, prediction_data, re_formula = NULL, draw_ids = draw_ids)
   }
-  boundary <- variable %in% c("distGeo_m", "food_difference") & d[[column]] < step
-  local <- matrix(NA_real_, length(ids), nrow(d))
+  boundary <- variable %in% c("distance_m", "food_difference") & model_data[[raw_column]] < derivative_step
+  local_slopes <- matrix(NA_real_, length(draw_ids), nrow(model_data))
   rows <- which(!boundary)
-  if (length(rows)) local[, rows] <- (predict_at(rows, step) - predict_at(rows, -step)) / (2 * step)
+  if (length(rows)) local_slopes[, rows] <- (predict_at(rows, derivative_step) - predict_at(rows, -derivative_step)) / (2 * derivative_step)
   rows <- which(boundary)
   # A second-order forward derivative keeps food and distance nonnegative at zero.
-  if (length(rows)) local[, rows] <-
-    (-3 * predict_at(rows, 0) + 4 * predict_at(rows, step) - predict_at(rows, 2 * step)) / (2 * step)
-  local
+  if (length(rows)) local_slopes[, rows] <-
+    (-3 * predict_at(rows, 0) + 4 * predict_at(rows, derivative_step) - predict_at(rows, 2 * derivative_step)) / (2 * derivative_step)
+  local_slopes
 }
 
 # Genetic-effect summaries reused by the trail robustness checks.
-genetic_robustness_effects <- function(fits, specs, transformations) {
-  imap_dfr(fits, function(fit, nm) {
-    local <- trail_local_slopes(fit, specs[[nm]], transformations, "FST_Latter", step = 1e-5)
-    multiplier <- if (specs[[nm]]$response_scale == "bernoulli") 100 else 1
-    draws <- multiplier * .01 * rowMeans(local)
-    label <- if (endsWith(nm, "_WC84")) "WC84" else if (endsWith(nm, "_tighter_genetic_prior"))
+genetic_robustness_effects <- function(model_fits, model_specs, trail_transformations) {
+  imap_dfr(model_fits, function(fit, model_name) {
+    local_slopes <- trail_local_slopes(fit, model_specs[[model_name]], trail_transformations, "FST_Latter", derivative_step = 1e-5)
+    multiplier <- if (model_specs[[model_name]]$response_scale == "bernoulli") 100 else 1
+    draws <- multiplier * .01 * rowMeans(local_slopes)
+    label <- if (endsWith(model_name, "_WC84")) "WC84" else if (endsWith(model_name, "_tighter_genetic_prior"))
       "Tighter genetic prior" else "Main (Latter)"
     bind_cols(tibble(Model = label), summarize_columns(matrix(draws, ncol = 1)))
   })

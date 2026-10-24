@@ -47,32 +47,32 @@ publication_theme <- function() {
 
 # Posterior figure formatting --------------------------------------------------
 
-style_genetic_plot <- function(p, groups) {
-  p + scale_colour_manual(values = figure_colours, breaks = groups) +
+style_genetic_plot <- function(plot, groups) {
+  plot + scale_colour_manual(values = figure_colours, breaks = groups) +
     scale_fill_manual(values = figure_colours, breaks = groups, guide = "none") +
     scale_linetype_manual(values = setNames(c("solid", "22")[seq_along(groups)], groups), breaks = groups) +
     scale_x_continuous(breaks = scales::breaks_pretty(4)) +
     scale_y_continuous(breaks = scales::breaks_pretty(5)) +
-    labs(x = "Geographic distance (m)", y = expression(F[ST]), colour = NULL, linetype = NULL)
+    labs(x = "Nest separation (m)", y = expression(F[ST]), colour = NULL, linetype = NULL)
 }
 
-style_trail_panel <- function(p, variable, j, presence, y_range) {
+style_trail_panel <- function(plot, variable, panel_index, presence, y_range) {
   titles <- c("A   Distance", "B   Genetic differentiation", "C   Food difference")
-  xlabels <- list("Geographic distance (m)", expression(F[ST]),
+  xlabels <- list("Local nest separation (m)", expression(F[ST]),
     "Food-income difference\n(10⁻⁴ cm⁻¹)")
-  p <- p + scale_x_continuous(breaks = scales::breaks_pretty(4),
+  plot <- plot + scale_x_continuous(breaks = scales::breaks_pretty(4),
     labels = if (variable == "food_difference")
       function(x) scales::number(x * 1e4, accuracy = .1) else scales::label_number(),
     expand = expansion(mult = c(.025, .04))) +
-    labs(x = xlabels[[j]], y = if (j == 1L) {
+    labs(x = xlabels[[panel_index]], y = if (panel_index == 1L) {
       if (presence) "Probability of a trail" else "Trail investment (log scale)"
-    } else NULL, title = titles[j]) +
+    } else NULL, title = titles[panel_index]) +
     theme(plot.margin = margin(6, 5, 6, 4))
   if (presence) {
-    p + scale_y_continuous(breaks = seq(0, 1, .25), limits = c(0, 1),
+    plot + scale_y_continuous(breaks = seq(0, 1, .25), limits = c(0, 1),
       expand = expansion(mult = c(.025, .04)))
   } else {
-    p + scale_y_log10(limits = y_range, labels = function(x)
+    plot + scale_y_log10(limits = y_range, labels = function(x)
       vapply(x, function(y) format(y, scientific = FALSE, trim = TRUE), character(1)),
       expand = expansion(mult = c(.035, .05)))
   }
@@ -84,39 +84,39 @@ arrange_panels <- function(panels, width, height, legend_plot = NULL, align_widt
   if (!is.null(legend_plot)) {
     legend_plot <- ggplotGrob(legend_plot)
     legend <- legend_plot$grobs[[which(legend_plot$layout$name == "guide-box-bottom")]]
-    panels <- lapply(panels, function(p) p + theme(legend.position = "none"))
+    panels <- lapply(panels, function(plot) plot + theme(legend.position = "none"))
   }
   grobs <- lapply(panels, ggplotGrob)
   if (align_widths) {
-    widths <- do.call(grid::unit.pmax, lapply(grobs, function(g) g$widths))
-    grobs <- lapply(grobs, function(g) { g$widths <- widths; g })
+    widths <- do.call(grid::unit.pmax, lapply(grobs, function(grob) grob$widths))
+    grobs <- lapply(grobs, function(grob) { grob$widths <- widths; grob })
   }
-  heights <- do.call(grid::unit.pmax, lapply(grobs, function(g) g$heights))
-  grobs <- lapply(grobs, function(g) { g$heights <- heights; g })
-  p <- gridExtra::arrangeGrob(grobs = grobs, nrow = 1)
+  heights <- do.call(grid::unit.pmax, lapply(grobs, function(grob) grob$heights))
+  grobs <- lapply(grobs, function(grob) { grob$heights <- heights; grob })
+  plot <- gridExtra::arrangeGrob(grobs = grobs, nrow = 1)
   if (!is.null(legend_plot)) {
-    p <- gridExtra::arrangeGrob(p, legend, ncol = 1,
+    plot <- gridExtra::arrangeGrob(plot, legend, ncol = 1,
       heights = grid::unit.c(grid::unit(1, "null"), grid::grobHeight(legend)))
   }
-  p
+  plot
 }
 
 # Prior figure formatting ------------------------------------------------------
 
-style_prior_panel <- function(p, variable, j, genetic, investment, y_range) {
+style_prior_panel <- function(plot, variable, panel_index, genetic, investment, y_range) {
   titles <- if (genetic) c("A   Within colony", "B   Between colonies") else
     c("A   Distance", "B   Genetic differentiation", "C   Food difference")
-  xlabels <- if (genetic) rep(list("Geographic distance (m)"), 2) else
-    list("Geographic distance (m)", expression(F[ST]), "Food-income difference\n(10⁻⁴ cm⁻¹)")
-  p <- p + scale_x_continuous(breaks = scales::breaks_pretty(4),
+  xlabels <- if (genetic) rep(list("Nest separation (m)"), 2) else
+    list("Nest separation (m)", expression(F[ST]), "Food-income difference\n(10⁻⁴ cm⁻¹)")
+  plot <- plot + scale_x_continuous(breaks = scales::breaks_pretty(4),
     labels = if (variable == "food_difference") function(x) scales::number(x * 1e4, accuracy = .1)
       else scales::label_number(), expand = expansion(mult = c(.02, .03))) +
-    labs(title = titles[j], x = xlabels[[j]], y = if (j == 1L) {
+    labs(title = titles[panel_index], x = xlabels[[panel_index]], y = if (panel_index == 1L) {
       if (genetic) expression(F[ST]) else if (investment) "Trail investment (log scale)"
         else "Probability of a trail"
     } else NULL)
-  if (investment) p + scale_y_log10(limits = y_range, labels = scales::label_number()) else
-    p + scale_y_continuous(limits = y_range, breaks = seq(0, 1, .25))
+  if (investment) plot + scale_y_log10(limits = y_range, labels = scales::label_number()) else
+    plot + scale_y_continuous(limits = y_range, breaks = seq(0, 1, .25))
 }
 
 initialize_output <- function() {
@@ -148,18 +148,18 @@ initialize_output <- function() {
     figure_files[[key]] <- list(preview = preview, paths = paths, width = width)
   }
   show_figure <- function(key, caption = "") {
-    f <- figure_files[[key]]
-    files <- if (length(f$paths)) htmltools::tagList(
+    figure_info <- figure_files[[key]]
+    files <- if (length(figure_info$paths)) htmltools::tagList(
       htmltools::tags$br(), "Files: ",
-      htmltools::tags$a(href = f$paths[1], download = basename(f$paths[1]), basename(f$paths[1])),
-      " · ", htmltools::tags$a(href = f$paths[2], download = basename(f$paths[2]), basename(f$paths[2]))
+      htmltools::tags$a(href = figure_info$paths[1], download = basename(figure_info$paths[1]), basename(figure_info$paths[1])),
+      " · ", htmltools::tags$a(href = figure_info$paths[2], download = basename(figure_info$paths[2]), basename(figure_info$paths[2]))
     )
     # RStudio captures printed HTML objects as inline notebook output.
     print(htmltools::tags$figure(
-      style = paste0("max-width:", round(f$width / 180 * 880), "px;margin:24px auto"),
+      style = paste0("max-width:", round(figure_info$width / 180 * 880), "px;margin:24px auto"),
       htmltools::tags$img(
         style = "width:100%", alt = caption,
-        src = base64enc::dataURI(file = f$preview, mime = "image/png")
+        src = base64enc::dataURI(file = figure_info$preview, mime = "image/png")
       ),
       htmltools::tags$figcaption(
         caption, files
@@ -214,9 +214,9 @@ show_presence_distance_slopes <- function(predictions) {
   invisible(predictions$estimates)
 }
 
-show_genetic_robustness <- function(fits, specs, transformations) {
-  presence <- specs[[1]]$response_scale == "bernoulli"
-  effects <- genetic_robustness_effects(fits, specs, transformations)
+show_genetic_robustness <- function(model_fits, model_specs, trail_transformations) {
+  presence <- model_specs[[1]]$response_scale == "bernoulli"
+  effects <- genetic_robustness_effects(model_fits, model_specs, trail_transformations)
   column <- paste0(if (presence) "AME in trail probability (percentage points per 0.01 FST)" else
     "AME in mean investment per 0.01 FST", " (95% credible interval)")
   show_table(effects |> transmute(Model,
@@ -228,15 +228,15 @@ show_genetic_robustness <- function(fits, specs, transformations) {
 
 # Data exclusions and FST checks (all three models) -------------------------------
 
-exclusion_tables <- function(processed) {
-  get_count <- function(label) processed$sample_counts$n[match(label, processed$sample_counts$quantity)]
-  genotypes <- processed$genotype_exclusions
+exclusion_tables <- function(processed_data) {
+  get_count <- function(label) processed_data$sample_counts$n[match(label, processed_data$sample_counts$quantity)]
+  genotypes <- processed_data$genotype_exclusions
   usable_nests <- n_distinct(genotypes$label[genotypes$included])
   input <- tibble(
     Records = c("Diploid ant–locus calls", "Ants", "Nests", "Internest trails", "Foraging trails"),
-    Available = c(sum(processed$locus_audit$diploid_samples), nrow(genotypes),
-      nrow(processed$nests), get_count("Internest trail records"), get_count("Foraging trail records")),
-    Retained = c(sum(processed$locus_audit$typed_diploid_calls), sum(genotypes$included),
+    Available = c(sum(processed_data$locus_audit$diploid_samples), nrow(genotypes),
+      nrow(processed_data$nests), get_count("Internest trail records"), get_count("Foraging trail records")),
+    Retained = c(sum(processed_data$locus_audit$typed_diploid_calls), sum(genotypes$included),
       usable_nests, get_count("Mapped internest trails"),
       get_count("Foraging trail records") - get_count("Unmapped foraging source nests")),
     Reason = c("At least one failed or missing allele", "No typed locus",
@@ -251,11 +251,11 @@ exclusion_tables <- function(processed) {
     missing_or_nonpositive_endpoint_size = "Missing or nonpositive nest size",
     invalid_positive_investment = "Missing or nonpositive investment"
   )
-  size_pairs <- with(processed$dyads, pair_id[!from_valid_size | !to_valid_size])
-  missing_size_pairs <- with(processed$dyads,
+  size_pairs <- with(processed_data$dyads, pair_id[!from_valid_size | !to_valid_size])
+  missing_size_pairs <- with(processed_data$dyads,
     pair_id[!is.finite(from_nest_size) | !is.finite(to_nest_size)])
-  reasons <- vapply(processed$sample_sizes$analysis, function(name) {
-    rows <- filter(processed$exclusion_rows, analysis == name)
+  reasons <- vapply(processed_data$sample_sizes$analysis, function(name) {
+    rows <- filter(processed_data$exclusion_rows, analysis == name)
     # Separate the analysis's scope from missing measurements; count each pair once.
     outside_scope <- rows$pair_id[rows$reason %in%
       c("unknown_colony", "not_known_within_colony", "no_observed_trail")]
@@ -270,12 +270,12 @@ exclusion_tables <- function(processed) {
       group_by(pair_id) |>
       summarise(reason = paste(sort(unique(reason)), collapse = "; "), .groups = "drop") |>
       count(reason, name = "pairs")
-    stopifnot(sum(counts$pairs) == processed$sample_sizes$measurement_exclusions[
-      processed$sample_sizes$analysis == name])
+    stopifnot(sum(counts$pairs) == processed_data$sample_sizes$measurement_exclusions[
+      processed_data$sample_sizes$analysis == name])
     if (!nrow(counts)) "None" else if (nrow(counts) == 1L) counts$reason else
       paste(paste0(counts$pairs, ": ", counts$reason), collapse = "; ")
   }, character(1))
-  models <- processed$sample_sizes |> transmute(
+  models <- processed_data$sample_sizes |> transmute(
     Analysis = vapply(analysis, model_label, character(1)),
     `Eligible pairs` = design_eligible_pairs,
     Excluded = measurement_exclusions, `Analysed pairs` = included_pairs,
@@ -284,19 +284,19 @@ exclusion_tables <- function(processed) {
   list(input = input, models = models)
 }
 
-show_data_audit <- function(processed) {
-  exclusions <- exclusion_tables(processed)
-  show_table(exclusions$input, caption = "Pre-processing exclusions, by type of record")
+show_data_audit <- function(processed_data) {
+  exclusions <- exclusion_tables(processed_data)
+  show_table(exclusions$input, caption = "Workbook exclusions before genetic screening, by type of record")
   show_table(exclusions$models, caption = "Model samples after applying each analysis's scope")
 }
 
-show_fst_audit <- function(processed) {
-  show_table(processed$fst_support |> transmute(
+show_fst_audit <- function(processed_data) {
+  show_table(processed_data$fst_support |> transmute(
     Estimator = estimator, Minimum = minimum, Maximum = maximum,
     Negative = negative, Zero = zero, `At least one` = one_or_above,
     Missing = missing_or_nonfinite
   ), digits = 4, caption = "FST estimates: support and missing values")
-  show_table(processed$fst_agreement |> transmute(
+  show_table(processed_data$fst_agreement |> transmute(
     Estimator = recode(estimator, FST_WC84 = "Weir–Cockerham", FST_Nei = "Nei"),
     Pairs = recode(pair_group, all = "All", within = "Within colony", between = "Between colonies"),
     `Correlation with Latter` = pearson,

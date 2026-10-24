@@ -19,37 +19,72 @@ local function raw(block)
   return block and block.t == 'RawBlock' and block.format == 'html' and block.text or ''
 end
 
+local function decode64(text)
+  local alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+  local out, bits, value = {}, 0, 0
+  for c in text:gmatch('[A-Za-z0-9+/]') do
+    value = value * 64 + alphabet:find(c, 1, true) - 1
+    bits = bits + 6
+    if bits >= 8 then
+      bits = bits - 8
+      out[#out + 1] = string.char(math.floor(value / 2^bits))
+      value = value % 2^bits
+    end
+  end
+  return table.concat(out)
+end
+
+local function read_file(path)
+  local file = io.open(path, 'r')
+  if not file then return nil end
+  local text = file:read('*a')
+  file:close()
+  return text
+end
+
+local function chunks(text)
+  local all, visible = {}, {}
+  for header, code in text:gmatch('```(%{r[^\n]*%})\n(.-)\n```') do
+    all[#all + 1] = header .. '\n' .. code
+    if not header:match('include%s*=%s*FALSE') then visible[#visible + 1] = code end
+  end
+  return table.concat(all, '\n'), visible
+end
+
 -- Read displayed code from the current notebook, not imported console records:
 -- older RStudio versions can add fences or corrupt quotes in those records.
 local function notebook_code()
   local input = PANDOC_STATE.input_files[1]
   local path = input:gsub('%.knit%.md$', '.Rmd'):gsub('%.utf8%.md$', '.Rmd')
-  local file = assert(io.open(path, 'r'), 'Cannot read notebook source: ' .. path)
-  local chunks, lines, header = {}, nil, nil
-  for line in file:lines() do
-    if not lines and line:match('^```%{r[%s,}]') then
-      header, lines = line, {}
-    elseif lines and line:match('^```%s*$') then
-      if not header:match('include%s*=%s*FALSE') then
-        chunks[#chunks + 1] = table.concat(lines, '\n')
-      end
-      lines, header = nil, nil
-    elseif lines then
-      lines[#lines + 1] = line
+  local text = assert(read_file(path), 'Cannot read notebook source: ' .. path)
+  local signature, codes = chunks(text)
+  local saved = {}
+  -- A fresh RStudio session may have no cached outputs. Recover from the
+  -- companion HTML only when every R chunk (including setup) is unchanged.
+  local html = read_file(path:gsub('%.Rmd$', '.nb.html'))
+  local encoded = html and html:match('<div id="rmd%-source%-code">(.-)</div>')
+  if encoded and chunks(decode64(encoded)) == signature then
+    for block in html:gmatch('<!%-%- rnb%-chunk%-begin %-%->(.-)<!%-%- rnb%-chunk%-end %-%->') do
+      saved[#saved + 1] = block:match('<!%-%- rnb%-source%-end %-%->(.*)') or ''
     end
   end
-  file:close()
-  return chunks
+  return codes, saved
 end
 
 function Pandoc(doc)
-  local codes = notebook_code()
+  local codes, saved = notebook_code()
   local output, stack, chunk, source = pandoc.List(), {}, 0, false
+  local has_output = false
   for i, block in ipairs(doc.blocks) do
     local text = raw(block)
     local keep = true
     if text:match('^<!%-%- rnb%-chunk%-begin') then
       chunk = chunk + 1
+      has_output = false
+    elseif text:match('^<!%-%- rnb%-chunk%-end') then
+      if not has_output and saved[chunk] and saved[chunk]:match('%S') then
+        output:insert(pandoc.RawBlock('html', saved[chunk]))
+      end
     elseif text:match('^<!%-%- rnb%-output%-begin') then
       local next_text = raw(doc.blocks[i + 1])
       local nested = next_text:match('<!%-%- rnb%-source%-begin') or
@@ -69,6 +104,8 @@ function Pandoc(doc)
       source = false
     elseif source and block.t == 'CodeBlock' then
       block.text = codes[chunk]
+    elseif not source and not text:match('^<!%-%- rnb%-') then
+      has_output = true
     end
     if keep then output:insert(block) end
   end

@@ -6,13 +6,13 @@
 # Shared sampling diagnostics ---------------------------------------------------
 
 diagnose_fit <- function(fit, name) {
-  dr <- as_draws_array(fit)
-  sm <- summarise_draws(dr)
+  posterior_draws <- as_draws_array(fit)
+  draw_summary <- summarise_draws(posterior_draws)
   # Constant parameters have undefined R-hat and are excluded explicitly.
-  sm <- sm |> filter(variable != "lp__", is.finite(sd), sd > 0)
+  draw_summary <- draw_summary |> filter(variable != "lp__", is.finite(sd), sd > 0)
 
-  np <- nuts_params(fit)
-  energy <- np |>
+  sampler_diagnostics <- nuts_params(fit)
+  energy <- sampler_diagnostics |>
     filter(Parameter == "energy__") |>
     group_by(Chain) |>
     summarise(ebfmi = mean(diff(Value)^2) / var(Value), .groups = "drop")
@@ -20,16 +20,16 @@ diagnose_fit <- function(fit, name) {
   depth_limit <- fit$fit@stan_args[[1]]$control$max_treedepth
   if (is.null(depth_limit)) depth_limit <- 12
   tibble(
-    model = name, max_rhat = max(sm$rhat, na.rm = TRUE),
-    min_ess_bulk = min(sm$ess_bulk, na.rm = TRUE),
-    min_ess_tail = min(sm$ess_tail, na.rm = TRUE),
-    divergences = sum(np$Parameter == "divergent__" & np$Value == 1),
+    model = name, max_rhat = max(draw_summary$rhat, na.rm = TRUE),
+    min_ess_bulk = min(draw_summary$ess_bulk, na.rm = TRUE),
+    min_ess_tail = min(draw_summary$ess_tail, na.rm = TRUE),
+    divergences = sum(sampler_diagnostics$Parameter == "divergent__" & sampler_diagnostics$Value == 1),
     initial_divergences = if (is.null(attr(fit, "initial_divergences"))) 0L else attr(fit, "initial_divergences"),
     initial_depth_hits = if (is.null(attr(fit, "initial_depth_hits"))) 0L else attr(fit, "initial_depth_hits"),
-    treedepth_hits = sum(np$Parameter == "treedepth__" & np$Value >= depth_limit),
+    treedepth_hits = sum(sampler_diagnostics$Parameter == "treedepth__" & sampler_diagnostics$Value >= depth_limit),
     max_treedepth = depth_limit,
     min_ebfmi = min(energy$ebfmi),
-    pass = all(is.finite(sm$rhat), is.finite(sm$ess_bulk), is.finite(sm$ess_tail)) &
+    pass = all(is.finite(draw_summary$rhat), is.finite(draw_summary$ess_bulk), is.finite(draw_summary$ess_tail)) &
       max_rhat < 1.01 & min_ess_bulk > 400 & min_ess_tail > 400 &
       divergences == 0 & treedepth_hits == 0 & min_ebfmi > .3
   )
@@ -38,15 +38,15 @@ diagnose_fit <- function(fit, name) {
 # Shared posterior predictive summaries ----------------------------------------
 # Predictions, response transformations and grouping choices are in the notebook.
 
-posterior_predictive_summary <- function(y, yr, name, statistics) {
-  stopifnot(ncol(yr) == length(y), all(is.finite(yr)))
+posterior_predictive_summary <- function(observed_outcomes, replicated_outcomes, name, statistics) {
+  stopifnot(ncol(replicated_outcomes) == length(observed_outcomes), all(is.finite(replicated_outcomes)))
   ppc_summary <- tibble()
-  for (stat in names(statistics)) {
-    f <- statistics[[stat]]
-    observed <- f(y)
-    simulated <- apply(yr, 1, f)
+  for (statistic_name in names(statistics)) {
+    statistic_function <- statistics[[statistic_name]]
+    observed <- statistic_function(observed_outcomes)
+    simulated <- apply(replicated_outcomes, 1, statistic_function)
     ppc_summary <- bind_rows(ppc_summary, tibble(
-      model = name, statistic = stat,
+      model = name, statistic = statistic_name,
       observed = observed, lower_rep = quantile(simulated, .025),
       median_rep = median(simulated), upper_rep = quantile(simulated, .975),
       probability_rep_above_observed = mean(simulated >= observed)
@@ -55,12 +55,12 @@ posterior_predictive_summary <- function(y, yr, name, statistics) {
   ppc_summary
 }
 
-posterior_group_checks <- function(y, yr, strata) {
+posterior_group_checks <- function(observed_outcomes, replicated_outcomes, strata) {
   imap_dfr(strata, function(stratum, name) {
-    groups <- split(seq_along(y), stratum)
+    groups <- split(seq_along(observed_outcomes), stratum)
     outside <- vapply(groups, function(rows) {
-      interval <- quantile(rowMeans(yr[, rows, drop = FALSE]), c(.025, .975))
-      mean(y[rows]) < interval[1] || mean(y[rows]) > interval[2]
+      interval <- quantile(rowMeans(replicated_outcomes[, rows, drop = FALSE]), c(.025, .975))
+      mean(observed_outcomes[rows]) < interval[1] || mean(observed_outcomes[rows]) > interval[2]
     }, logical(1))
     tibble(
       Grouping = if (name == "colony") "Colony" else "Distance quartile",
@@ -71,39 +71,41 @@ posterior_group_checks <- function(y, yr, strata) {
 
 # Model 1: Genetic distributions and residual skewness --------------------------
 
-genetic_predictive_summary <- function(zr, mu, sigma, d, name) {
-  y <- plogis(d$response)
-  yr <- plogis(zr)
-  category <- ifelse(d$same_colony == 1, "Within", "Between")
+genetic_predictive_summary <- function(replicated_logit_fst, logit_mean_draws, logit_sd_draws, model_data, name) {
+  observed_outcomes <- plogis(model_data$response)
+  replicated_outcomes <- plogis(replicated_logit_fst)
+  category <- ifelse(model_data$same_colony == 1, "Within", "Between")
   skewness <- function(x) mean((x - mean(x))^3) / stats::sd(x)^3
-  groups <- split(seq_len(nrow(d)), category)
+  groups <- split(seq_len(nrow(model_data)), category)
   results <- list()
   for (group in names(groups)) {
-    ii <- groups[[group]]
+    group_rows <- groups[[group]]
     statistics <- list(
       minimum = min, median = median, maximum = max, sd = stats::sd,
       skewness = skewness
     )
-    out <- imap_dfr(statistics, function(f, statistic) {
-      simulated <- apply(yr[, ii, drop = FALSE], 1, f)
+    group_summary <- imap_dfr(statistics, function(statistic_function, statistic) {
+      simulated <- apply(replicated_outcomes[, group_rows, drop = FALSE], 1, statistic_function)
       tibble(
         model = name, group = group, statistic = statistic,
-        observed = f(y[ii]), lower = quantile(simulated, .025), estimate = median(simulated),
-        upper = quantile(simulated, .975), probability_rep_above = mean(simulated >= f(y[ii]))
+        observed = statistic_function(observed_outcomes[group_rows]), lower = quantile(simulated, .025), estimate = median(simulated),
+        upper = quantile(simulated, .975), probability_rep_above = mean(simulated >= statistic_function(observed_outcomes[group_rows]))
       )
     })
     # Compare observed and replicated residuals using the same posterior draw.
-    observed_residual <- sweep(-mu[, ii, drop = FALSE], 2, d$response[ii], "+") / sigma[, ii, drop = FALSE]
-    replicated_residual <- (zr[, ii, drop = FALSE] - mu[, ii, drop = FALSE]) / sigma[, ii, drop = FALSE]
+    observed_residual <- sweep(-logit_mean_draws[, group_rows, drop = FALSE],
+      2, model_data$response[group_rows], "+") / logit_sd_draws[, group_rows, drop = FALSE]
+    replicated_residual <- (replicated_logit_fst[, group_rows, drop = FALSE] -
+      logit_mean_draws[, group_rows, drop = FALSE]) / logit_sd_draws[, group_rows, drop = FALSE]
     observed_skewness <- apply(observed_residual, 1, skewness)
     simulated <- apply(replicated_residual, 1, skewness)
-    out <- bind_rows(out, tibble(
+    group_summary <- bind_rows(group_summary, tibble(
       model = name, group = group, statistic = "residual_skewness",
       observed = median(observed_skewness),
       lower = quantile(simulated, .025), estimate = median(simulated), upper = quantile(simulated, .975),
       probability_rep_above = mean(simulated >= observed_skewness)
     ))
-    results[[group]] <- out
+    results[[group]] <- group_summary
   }
   bind_rows(results)
 }

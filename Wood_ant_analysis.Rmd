@@ -10,14 +10,14 @@ output:
 editor_options:
   chunk_output_type: inline
 ---
-# Reproducing the analysis {#reproducing-the-analysis}
-
-Keep this folder together. In RStudio, use **File → Open File** to open `Wood_ant_analysis.nb.html`, then edit the `.Rmd` tab and save. This updates the HTML while retaining the saved figures and tables; the models do not need to be rerun.
+# Project structure
 
 | File | Contents |
 |:---|:---|
 | [Statistical_methods.md](Statistical_methods.md) | Concise paper methods, model formulations and prior justifications |
 | [process_data.R](process_data.R) | Workbook processing, FST estimates, exclusions and data validation |
+| [analysis_helpers/genetic_screening.R](analysis_helpers/genetic_screening.R) | Shared ant, locus and nest screening for all analyses |
+| [AMOVA/AMOVA.R](AMOVA/AMOVA.R) | AMOVA adapted analysis to the shared genotypes |
 | [analysis_helpers/model_helpers.R](analysis_helpers/model_helpers.R) | Shared predictor transformations and sampling refinement |
 | [analysis_helpers/prior_checks.R](analysis_helpers/prior_checks.R) | Reusable prior simulations and integration |
 | [analysis_helpers/diagnostics.R](analysis_helpers/diagnostics.R) | Sampling and posterior predictive checks |
@@ -29,7 +29,7 @@ Keep this folder together. In RStudio, use **File → Open File** to open `Wood_
 ```{r install-instructions, eval=FALSE}
 install.packages(c(
   "rmarkdown", "readxl", "tidyverse", "adegenet", "hierfstat",
-  "geosphere", "brms", "posterior", "bayesplot", "gridExtra", "ragg", "svglite", "base64enc"
+  "geosphere", "poppr", "brms", "posterior", "bayesplot", "gridExtra", "ragg", "svglite", "base64enc"
 ))
 install.packages("cmdstanr", repos = c("https://stan-dev.r-universe.dev", getOption("repos")))
 cmdstanr::install_cmdstan(version = "2.39.0")
@@ -41,6 +41,7 @@ The [methods document](Statistical_methods.md) gives the concise paper methods, 
 
 | Analysis | Question | Paper figures and results |
 |:---|:---|:---|
+| [AMOVA](#amova) | How is genetic variation partitioned among colonies, nests and ants? | [Results](#amova) |
 | [Model 1: Genetic differentiation](#model-genetic) | How does differentiation vary with distance within and between colonies? | [Results and figures](#genetic-results) |
 | [Model 2: Trail presence](#model-presence) | Which nest pairs are more likely to have a trail? | [Results and figures](#presence-results) |
 | [Model 3: Trail investment](#model-investment) | How does investment vary among existing trails? | [Results and figures](#investment-results) |
@@ -54,6 +55,8 @@ options(brms.backend = "cmdstanr")
 seed <- 20261015
 set.seed(seed)
 source("process_data.R", local = TRUE)
+source("analysis_helpers/genetic_screening.R", local = TRUE)
+source("AMOVA/AMOVA.R", local = TRUE)
 source("analysis_helpers/model_helpers.R", local = TRUE)
 source("analysis_helpers/prior_checks.R", local = TRUE)
 source("analysis_helpers/diagnostics.R", local = TRUE)
@@ -149,38 +152,64 @@ Missing allele calls made 1,122 of 15,928 genotypes unusable; one ant with no us
 
 # Data processing
 
-This call processes the workbook, validates the data and calculates FST estimates,
-then reports sample sizes, exclusions and estimator agreement.
+This call processes the workbook, applies the shared genetic screen and recalculates FST. All analyses below use the screened data.
 
 ```{r process-workbook}
-processed <- process_wood_ant_data("data/wood_ant_data.xlsx")
-analysis_data <- processed$analysis_data
+processed_data <- process_wood_ant_data("data/wood_ant_data.xlsx")
+genetic_screening <- screen_genotypes(processed_data$genotypes)
+screened_data <- rebuild_screened_data(processed_data, genetic_screening)
+analysis_data <- screened_data$analysis_data
 ```
 
 ## Sample sizes and exclusions
 
-**FST estimation.** Fifteen of 196 nests had no genotype samples and could not
-contribute to FST estimation. The remaining 181 nests contributed 1,448 ants,
-with 11 microsatellite loci per ant. We treated an ant's genotype at a locus as
-missing if either allele call had failed; this affected 1,122 of 15,928 genotypes
-(7.0%). Missing genotypes were not imputed; ants contributed data at loci where
-they had usable genotypes. One ant with no usable genotypes was excluded, leaving
-1,447 ants from 181 nests. Missing nest size, food data or colony identity did
-not exclude genetic data from FST estimation.
+**Genotype processing.** Fifteen of 196 nests had no genotype samples. The remaining 181 nests contributed 1,448 ants, with 11 microsatellite loci per ant. We treated an ant's genotype at a locus as missing if either allele call had failed; this affected 1,122 of 15,928 genotypes (7.0%). Missing genotypes were not imputed; ants contributed data at loci where they had usable genotypes. One ant with no usable genotypes was excluded, leaving 1,447 ants from 181 nests before screening.
 
-```{r data-exclusions}
-show_data_audit(processed)
+## Shared genetic screening {#genetic-screening}
+
+All analyses use the same screened genotypes. Restricting to known colonies retained 847 ants from 106 nests, excluding 600 ants from 75 nests of unknown colony identity. We then removed 55 ants missing more than 30% of the 11 loci, followed by FE16 and FE21, which exceeded 5% missingness among the remaining ants. One nest (colony 4, N19) contained only three remaining ants and was excluded because it fell below the four-ant minimum. Excluding this nest also removed one of the 86 mapped internest trails, leaving 85. This left 789 ants from 105 nests in ten colonies, with nine loci. The thresholds were applied once, in that order.
+
+```{r genetic-screening}
+show_table(genetic_screening$counts |> transmute(Stage = stage, Ants = ants, Nests = nests, Loci = loci),
+  caption = "Sequential genetic screening")
+show_table(genetic_screening$locus_missingness |> filter(!retained) |>
+  transmute(Locus = locus, `Missing genotypes (%)` = 100 * missing_fraction), digits = 2,
+  caption = "Loci excluded after the ant screen")
 ```
 
-**Statistical models.** Pair-level exclusions were applied after FST estimation and did not remove genetic data from that calculation. The main genetic model excluded 10,725 pairs with unknown colony membership, retaining 5,565. No pairs were excluded for missing FST or distance. Of 667 known within-colony pairs, trail presence excluded 17 because one nest lacked the population estimate needed for food difference, leaving 650. Investment excluded one of 86 observed within-colony trails because that same missing estimate prevented calculation of both food difference and investment, leaving 85. These exclusions overlap and should not be summed.
+FST is calculated from these screened genotypes. Partially failed loci remain missing, and the two fully typed ants absent from the supplied Genepop file are retained.
 
-These omissions are simplest to justify if missingness is unrelated to observed or unobserved characteristics (missing completely at random), which was not established. Selective genotype failure could bias FST; selective missingness in model predictors could bias the regression estimates.
+**Statistical models.** Pair-level exclusions were applied after FST estimation. The genetic model retained all 5,460 pairs (662 within and 4,798 between colonies), with no exclusions for missing FST or distance. Trail presence used the 662 within-colony pairs, excluding 17 because one nest lacked the population estimate needed for food difference, leaving 645. Investment excluded 577 within-colony pairs without trails, then one of 85 observed trails because that same missing estimate prevented calculation of food difference and investment, leaving 84. These exclusions overlap and should not be summed.
+
+```{r data-exclusions}
+audit <- processed_data
+audit[names(screened_data)] <- screened_data
+show_data_audit(audit)
+```
+
+These omissions are simplest to justify if missingness is unrelated to observed or unobserved characteristics (missing completely at random), which was not established. Selective genotype failure could bias FST; selective missingness in model predictors could bias the regression estimates. Screening does not propagate FST estimation uncertainty.
 
 ## FST estimates
 
 ```{r fst-reconstruction-checks}
-show_fst_audit(processed)
+show_fst_audit(screened_data)
 ```
+
+# AMOVA: Partitioning genetic variation {#amova}
+
+The AMOVA partitions differences among diploid ants into variation between colonies, between nests within colonies and between ants within nests. Uses the shared screened genotypes, allele-frequency distances with a quasi-Euclidean correction, and 999 permutations. Missing genotypes are not imputed; distances use the available allele entries for each pair, rescaled for the number available.
+
+```{r amova-results}
+amova <- run_wood_ant_amova(genetic_screening$genotypes, seed = 20261021L, permutations = 999L)
+show_table(amova$summary |> rename(`Sum of squares` = sum_squares, `Mean square` = mean_squares),
+  digits = 3, caption = "AMOVA sums of squares and degrees of freedom")
+show_table(left_join(amova$variance, select(amova$permutation, Source, p_value), by = "Source") |>
+  rename(Variance = variance, `Variance (%)` = percent, `Permutation p` = p_value),
+  digits = 4, caption = "AMOVA variance components and permutation tests")
+show_table(amova$phi, digits = 4, caption = "Hierarchical genetic differentiation (Phi statistics)")
+```
+
+**Interpretation.** Most variation was between ants within nests (85.1%), with 7.5% between nests within colonies and 7.4% between colonies. Each variance-component test gave a permutation p-value of 0.001 (from 999 permutations).
 
 # Analysis conventions
 
@@ -223,25 +252,22 @@ appear inline only; paper figures also have SVG and 600 dpi PNG files linked
 beneath them.
 
 ```{r analysis-containers}
-specs <- fits <- robustness_specs <- robustness_fits <- list()
-posterior_by_model <- list()
+model_specs <- model_fits <- robustness_model_specs <- robustness_fits <- list()
+predictive_checks <- list()
 ```
 
 # Model 1: Genetic differentiation {#model-genetic}
 
 **Question and interpretation.** How does genetic differentiation vary with distance within and between colonies?
 
-**Data.** The main comparison contains 5,565 pairs from 106 nests in ten colonies:
-667 within-colony and 4,898 between-colony pairs. We excluded 10,725 pairs
-involving nests of unknown colony membership. No pairs were excluded for
-missing FST or geographic distance.
+**Data.** The comparison contains 5,460 pairs from 105 nests in ten colonies: 662 within-colony and 4,798 between-colony pairs. The shared genetic screen is described above; no further pairs were excluded for missing FST or geographic distance.
 
 ## Model formulation
 
 Let $\widehat F_i$ be pair $i$'s Latter FST and $D_i$ its distance
-in metres. Set $S_i=1$ within colonies and $S_i=0$ between colonies. Let $g(i)$
+in metres: local-map separation within colonies and GPS distance between colonies. Set $S_i=1$ within colonies and $S_i=0$ between colonies. Let $g(i)$
 identify the unordered colony combination (A–B and B–A share $g$), and
-$\bar D_g$ its mean distance among pairs used for fitting. Define
+$\bar D_g$ its mean distance among known-colony pairs before genetic screening. Define
 
 \[
  x_i=\frac{D_i-50}{100},\qquad
@@ -292,48 +318,52 @@ These coefficients are not constant differences on the original FST scale.
 
 The pair intercept captures a baseline deviation beyond the colony effects.
 For between-colony combinations, distance centring defines this deviation at
-that combination's mean observed distance.
+that combination's mean distance before genetic screening.
 Pair terms allow colony combinations to differ in baseline differentiation
 and between-colony distance trends.
 
 ## Specify the model
 
+We retain the centring and scaling values defined before genetic screening, so the priors remain unchanged. Only the screened data enter the fitted models.
+
 ```{r m1-specification}
-data_m1 <- prepare_genetic(analysis_data$m1)
-prior_m1 <- list(
+genetic_data <- prepare_genetic(analysis_data$m1)
+genetic_prior_settings <- list(
   intercept = c(qlogis(.1), .8), same_colony = .7,
   between_slope = .1, within_slope = 1, endpoint_sd = .3,
   pair_intercept_sd = .3, pair_slope_sd = .5,
   log_sigma = c(log(.3), .6), sigma_contrast = .5
 )
-data_m1$colony_pair <- with(data_m1, factor(paste(pmin(as.character(from_colony), as.character(to_colony)),
+genetic_data$colony_pair <- with(genetic_data, factor(paste(pmin(as.character(from_colony), as.character(to_colony)),
   pmax(as.character(from_colony), as.character(to_colony)),
   sep = " / "
 )))
-data_m1 <- centre_colony_pair_distance(data_m1)
+genetic_data <- centre_colony_pair_distance(genetic_data, reference = processed_data$analysis_data$m1)
 # Colony combinations can differ in baseline differentiation and distance trend.
 # Partial pooling draws uncertain slopes towards the overall between-colony slope.
 # The within-colony slope remains separate; pair deviations have no correlation parameter.
-formula_m1 <- bf(response ~ 0 + Intercept + same_colony + distance_between + distance_within +
+genetic_formula <- bf(response ~ 0 + Intercept + same_colony + distance_between + distance_within +
   (1 | mm(from_label, to_label, weights = cbind(w1, w2), scale = FALSE)) +
   (1 | mm(from_colony, to_colony, weights = cbind(w1, w2), scale = FALSE)) +
   (1 + pair_distance_between || colony_pair), sigma ~ 0 + Intercept + same_colony)
-priors_m1 <- c(
-  set_prior(normal_prior(prior_m1$intercept[1], prior_m1$intercept[2]), class = "b", coef = "Intercept"),
-  set_prior(normal_prior(0, prior_m1$same_colony), class = "b", coef = "same_colony"),
-  set_prior(normal_prior(0, prior_m1$between_slope), class = "b", coef = "distance_between"),
-  set_prior(normal_prior(0, prior_m1$within_slope), class = "b", coef = "distance_within"),
-  set_prior(normal_prior(0, prior_m1$endpoint_sd), class = "sd"),
-  set_prior(normal_prior(0, prior_m1$sigma_contrast), class = "b", dpar = "sigma"),
-  set_prior(normal_prior(prior_m1$log_sigma[1], prior_m1$log_sigma[2]), class = "b", coef = "Intercept", dpar = "sigma"),
-  set_prior(normal_prior(0, prior_m1$pair_intercept_sd), class = "sd", group = "colony_pair", coef = "Intercept"),
-  set_prior(normal_prior(0, prior_m1$pair_slope_sd), class = "sd", group = "colony_pair", coef = "pair_distance_between")
+genetic_priors <- c(
+  set_prior(normal_prior(genetic_prior_settings$intercept[1], genetic_prior_settings$intercept[2]), class = "b", coef = "Intercept"),
+  set_prior(normal_prior(0, genetic_prior_settings$same_colony), class = "b", coef = "same_colony"),
+  set_prior(normal_prior(0, genetic_prior_settings$between_slope), class = "b", coef = "distance_between"),
+  set_prior(normal_prior(0, genetic_prior_settings$within_slope), class = "b", coef = "distance_within"),
+  set_prior(normal_prior(0, genetic_prior_settings$endpoint_sd), class = "sd"),
+  set_prior(normal_prior(0, genetic_prior_settings$sigma_contrast), class = "b", dpar = "sigma"),
+  set_prior(normal_prior(genetic_prior_settings$log_sigma[1], genetic_prior_settings$log_sigma[2]),
+    class = "b", coef = "Intercept", dpar = "sigma"),
+  set_prior(normal_prior(0, genetic_prior_settings$pair_intercept_sd), class = "sd", group = "colony_pair", coef = "Intercept"),
+  set_prior(normal_prior(0, genetic_prior_settings$pair_slope_sd), class = "sd", group = "colony_pair", coef = "pair_distance_between")
 )
-specs$m1 <- list(
-  name = "m1", formula = formula_m1, data = data_m1, family = gaussian(), prior = priors_m1, prior_parameters = prior_m1,
+model_specs$m1 <- list(
+  name = "m1", formula = genetic_formula, data = genetic_data, family = gaussian(),
+  prior = genetic_priors, prior_parameters = genetic_prior_settings,
   response_scale = "logit"
 )
-specs$m1$formula
+model_specs$m1$formula
 ```
 
 ## Priors and prior predictions
@@ -350,31 +380,32 @@ Simulations include all group effects and response variation. FST above 0.9 shou
 # Expected-response curves: 100 draws, with group deviations set to zero.
 set.seed(seed + 702L)
 draws <- 100L
-d <- specs$m1$data
-pr <- specs$m1$prior_parameters
-a <- rnorm(draws, pr$intercept[1], pr$intercept[2])
-delta <- rnorm(draws, 0, pr$same_colony)
-b_between <- rnorm(draws, 0, pr$between_slope)
-b_within <- rnorm(draws, 0, pr$within_slope)
-log_sigma <- rnorm(draws, pr$log_sigma[1], pr$log_sigma[2])
-sigma_contrast <- rnorm(draws, 0, pr$sigma_contrast)
-prior_curves_m1 <- setNames(lapply(c(1L, 0L), function(within) {
-  x <- seq(min(d$distGeo_m[d$same_colony == within]),
-    max(d$distGeo_m[d$same_colony == within]), length.out = 80L)
-  mu <- a + delta * within + outer(if (within == 1L) b_within else b_between, (x - 50) / 100)
-  sigma <- exp(log_sigma + sigma_contrast * within)
-  long_prior_draws(x, prior_mean_fst(mu, sigma))
+model_data <- model_specs$m1$data
+prior_settings <- model_specs$m1$prior_parameters
+intercept_draws <- rnorm(draws, prior_settings$intercept[1], prior_settings$intercept[2])
+same_colony_draws <- rnorm(draws, 0, prior_settings$same_colony)
+between_distance_draws <- rnorm(draws, 0, prior_settings$between_slope)
+within_distance_draws <- rnorm(draws, 0, prior_settings$within_slope)
+log_residual_sd_draws <- rnorm(draws, prior_settings$log_sigma[1], prior_settings$log_sigma[2])
+log_residual_sd_contrast_draws <- rnorm(draws, 0, prior_settings$sigma_contrast)
+genetic_prior_curves <- setNames(lapply(c(1L, 0L), function(within) {
+  x <- seq(min(model_data$distance_m[model_data$same_colony == within]),
+    max(model_data$distance_m[model_data$same_colony == within]), length.out = 80L)
+  linear_predictor_draws <- intercept_draws + same_colony_draws * within +
+    outer(if (within == 1L) within_distance_draws else between_distance_draws, (x - 50) / 100)
+  residual_sd_draws <- exp(log_residual_sd_draws + log_residual_sd_contrast_draws * within)
+  long_prior_draws(x, prior_mean_fst(linear_predictor_draws, residual_sd_draws))
 }), c("Within colony", "Between colonies"))
-panels <- lapply(seq_along(prior_curves_m1), function(j) {
-  obs <- d[d$same_colony == as.integer(j == 1L), ]
-  p <- ggplot(prior_curves_m1[[j]], aes(x, y, group = draw)) +
+panels <- lapply(seq_along(genetic_prior_curves), function(j) {
+  observed_data <- model_data[model_data$same_colony == as.integer(j == 1L), ]
+  plot <- ggplot(genetic_prior_curves[[j]], aes(x, y, group = draw)) +
     geom_line(colour = unname(figure_colours[j]), alpha = .2, linewidth = .22) +
-    geom_point(data = tibble(x = obs$distGeo_m, y = obs$FST_Latter), aes(x, y),
+    geom_point(data = tibble(x = observed_data$distance_m, y = observed_data$FST_Latter), aes(x, y),
       inherit.aes = FALSE, colour = "#222222", alpha = .12, size = .6)
-  style_prior_panel(p, "distGeo_m", j, genetic = TRUE, investment = FALSE, y_range = c(0, 1))
+  style_prior_panel(plot, "distance_m", j, genetic = TRUE, investment = FALSE, y_range = c(0, 1))
 })
-p <- arrange_panels(panels, width = 180, height = 94)
-save_figure("m1_prior_trends", p, width = 180, height = 94)
+plot <- arrange_panels(panels, width = 180, height = 94)
+save_figure("m1_prior_trends", plot, width = 180, height = 94)
 show_figure("m1_prior_trends", paste0(
   "100 prior-drawn response curves per panel; points are observations for reference. ",
   "Group-specific deviations are zero. ",
@@ -383,26 +414,26 @@ show_figure("m1_prior_trends", paste0(
 
 # Full prior predictions include shared group effects and observation noise.
 set.seed(seed + 20L)
-prior_sim_m1 <- simulate_genetic_prior(specs$m1, draws = 4000L)
-yrep <- prior_sim_m1$yrep
-prior_summary_m1 <- tibble(`Dataset median` = apply(yrep, 1, median),
-  `Dataset maximum` = apply(yrep, 1, max))
-pp <- prior_summary_m1 |> pivot_longer(everything(), names_to = "statistic", values_to = "value") |>
-  mutate(statistic = factor(statistic, levels = names(prior_summary_m1)))
-p <- ggplot(pp, aes(value)) +
+genetic_prior_simulation <- simulate_genetic_prior(model_specs$m1, draws = 4000L)
+replicated_outcomes <- genetic_prior_simulation$yrep
+genetic_prior_summary <- tibble(`Dataset median` = apply(replicated_outcomes, 1, median),
+  `Dataset maximum` = apply(replicated_outcomes, 1, max))
+prior_summary_long <- genetic_prior_summary |> pivot_longer(everything(), names_to = "statistic", values_to = "value") |>
+  mutate(statistic = factor(statistic, levels = names(genetic_prior_summary)))
+plot <- ggplot(prior_summary_long, aes(value)) +
   geom_histogram(bins = 35, fill = "#0072B2", colour = "white", linewidth = .15) +
   facet_wrap(~statistic, scales = "free_x") +
   labs(x = expression(F[ST]), y = "Simulations", title = model_label("m1"))
-save_figure("m1_prior", p, width = 180, height = 80)
+save_figure("m1_prior", plot, width = 180, height = 80)
 show_figure("m1_prior", paste(4000,
-  "simulations include all group effects and response noise, using", nrow(prior_sim_m1$data),
+  "simulations include all group effects and response noise, using", nrow(genetic_prior_simulation$data),
   "evenly spaced design rows. Each value summarises one simulated dataset."))
-groups <- ifelse(prior_sim_m1$data$same_colony == 1, "Within", "Between")
-prior_tails_m1 <- imap_dfr(split(seq_len(ncol(yrep)), groups), function(ii, group) {
-  tibble(group = group, `FST < 0.001 (%)` = 100 * mean(yrep[, ii] < .001),
-    `FST > 0.5 (%)` = 100 * mean(yrep[, ii] > .5), `FST > 0.9 (%)` = 100 * mean(yrep[, ii] > .9))
+groups <- ifelse(genetic_prior_simulation$data$same_colony == 1, "Within", "Between")
+genetic_prior_tails <- imap_dfr(split(seq_len(ncol(replicated_outcomes)), groups), function(ii, group) {
+  tibble(group = group, `FST < 0.001 (%)` = 100 * mean(replicated_outcomes[, ii] < .001),
+    `FST > 0.5 (%)` = 100 * mean(replicated_outcomes[, ii] > .5), `FST > 0.9 (%)` = 100 * mean(replicated_outcomes[, ii] > .9))
 })
-show_table(prior_tails_m1, digits = 4,
+show_table(genetic_prior_tails, digits = 4,
   caption = paste(model_label("m1"), "prior tail probabilities, as percentages"))
 ```
 
@@ -413,23 +444,40 @@ show_table(prior_tails_m1, digits = 4,
 ```{r m1-fit}
 sampling_dir <- tempfile("wood-ant-sampling-")
 dir.create(sampling_dir)
-fits$m1 <- brm(
-  formula = specs$m1$formula, data = specs$m1$data,
-  family = specs$m1$family, prior = specs$m1$prior,
+model_fits$m1 <- brm(
+  formula = model_specs$m1$formula, data = model_specs$m1$data,
+  family = model_specs$m1$family, prior = model_specs$m1$prior,
   backend = "cmdstanr", chains = 4, cores = 4,
-  iter = 3000L, warmup = 2000L, seed = seed, init = 0,
+  iter = 3000L, warmup = 2000L, seed = 20261021L, init = 0,
   control = list(adapt_delta = .99, max_treedepth = 13, metric = "diag_e"),
   save_pars = save_pars(all = TRUE), output_dir = sampling_dir,
   refresh = 200, silent = 1
 )
-fits$m1 <- refine_sampling_fit(fits$m1, seed, sampling_dir)
+model_fits$m1 <- refine_sampling_fit(model_fits$m1, 20261021L, sampling_dir)
+# Collect more draws if convergence remains inadequate after refinement.
+if (!diagnose_fit(model_fits$m1, "m1")$pass) {
+  initial_depth_hits <- attr(model_fits$m1, "initial_depth_hits")
+  sampler_metadata <- attr(model_fits$m1$fit, "metadata")
+  sampling_dir <- tempfile("wood-ant-sampling-")
+  dir.create(sampling_dir)
+  model_fits$m1 <- update(model_fits$m1,
+    backend = "cmdstanr", cores = 4,
+    iter = 2500L, warmup = 500L, seed = 20261023L, init = 0,
+    inv_metric = sampler_metadata$inv_metric, step_size = unlist(sampler_metadata$step_size),
+    control = list(adapt_delta = .99, max_treedepth = 14, metric = "diag_e",
+      init_buffer = 0L, window = 0L, term_buffer = 500L),
+    output_dir = sampling_dir, refresh = 250, silent = 1
+  )
+  attr(model_fits$m1, "initial_depth_hits") <- initial_depth_hits
+  unlink(sampling_dir, recursive = TRUE)
+}
 ```
 
 
 ```{r m1-sampling}
-diagnostics_m1 <- diagnose_fit(fits$m1, "m1")
-show_table(diagnostics_m1)
-stopifnot(all(diagnostics_m1$pass))
+genetic_diagnostics <- diagnose_fit(model_fits$m1, "m1")
+show_table(genetic_diagnostics)
+stopifnot(all(genetic_diagnostics$pass))
 ```
 
 ## Results {#genetic-results}
@@ -440,48 +488,48 @@ accounting for the different residual variation within and between colonies.
 ### Main comparison: shared range with group-specific deviations set to zero
 
 For Model 1, we used distance-standardised predictions with group-specific deviations set to zero.
-Both categories used the same 201 equally spaced midpoints across their shared range (approximately 14.0–66.8 m), with equal weights.
+Both categories used the same 201 equally spaced midpoints across their shared range (approximately 14.0–53.0 m), with equal weights.
 Within each posterior draw, we averaged mean FST and local slopes separately for each
 category, then calculated the within-minus-between contrasts. The first table
 reports mean FST and its contrast; the second reports average marginal effects
-in FST per metre and their contrast. All 5,565 pairs remain in the fitted model.
+in FST per metre and their contrast. All 5,460 pairs remain in the fitted model.
 
 ```{r genetic-results}
 check_prediction_integration()
-d <- specs$m1$data
+model_data <- model_specs$m1$data
 groups <- c("Within colony", "Between colonies")
-ranges <- vapply(c(1L, 0L), function(g) range(d$distGeo_m[d$same_colony == g]), numeric(2))
+ranges <- vapply(c(1L, 0L), function(g) range(model_data$distance_m[model_data$same_colony == g]), numeric(2))
 shared_range <- c(low = max(ranges[1, ]), high = min(ranges[2, ]))
-points <- 201L
-step <- .01
-width <- diff(shared_range)
-stopifnot(points >= 2L, width > 0, step > 0, step < width / (2 * points))
+grid_size <- 201L
+derivative_step <- .01
+range_width <- diff(shared_range)
+stopifnot(grid_size >= 2L, range_width > 0, derivative_step > 0, derivative_step < range_width / (2 * grid_size))
 # Equally weighted midpoints keep the derivative steps inside the shared range.
-distance <- shared_range[1] + (seq_len(points) - .5) * width / points
-ids_results_m1 <- seq_len(ndraws(fits$m1))
-levels <- slopes <- matrix(0, length(ids_results_m1), 2L, dimnames = list(NULL, groups))
+distance_grid <- shared_range[1] + (seq_len(grid_size) - .5) * range_width / grid_size
+genetic_result_draw_ids <- seq_len(ndraws(model_fits$m1))
+mean_response_draws <- mean_slope_draws <- matrix(0, length(genetic_result_draw_ids), 2L, dimnames = list(NULL, groups))
 for (g in seq_along(groups)) {
-  ix <- which(d$same_colony == as.integer(g == 1L))[1]
-  newdata <- d[rep(ix, points), , drop = FALSE]
-  newdata <- shift_genetic_distance(newdata, distance - newdata$distGeo_m)
+  ix <- which(model_data$same_colony == as.integer(g == 1L))[1]
+  newdata <- model_data[rep(ix, grid_size), , drop = FALSE]
+  newdata <- shift_genetic_distance(newdata, distance_grid - newdata$distance_m)
   # Integrate residual variation to obtain expected FST; group deviations are zero.
-  ep <- expected_response(fits$m1, specs$m1, newdata, re_formula = NA, ids = ids_results_m1)
-  low <- expected_response(fits$m1, specs$m1, shift_genetic_distance(newdata, -step),
-    re_formula = NA, ids = ids_results_m1)
-  high <- expected_response(fits$m1, specs$m1, shift_genetic_distance(newdata, step),
-    re_formula = NA, ids = ids_results_m1)
-  levels[, g] <- rowMeans(ep)
-  slopes[, g] <- rowMeans((high - low) / (2 * step))
+  expected_draws <- expected_response(model_fits$m1, model_specs$m1, newdata, re_formula = NA, draw_ids = genetic_result_draw_ids)
+  lower_predictions <- expected_response(model_fits$m1, model_specs$m1, shift_genetic_distance(newdata, -derivative_step),
+    re_formula = NA, draw_ids = genetic_result_draw_ids)
+  upper_predictions <- expected_response(model_fits$m1, model_specs$m1, shift_genetic_distance(newdata, derivative_step),
+    re_formula = NA, draw_ids = genetic_result_draw_ids)
+  mean_response_draws[, g] <- rowMeans(expected_draws)
+  mean_slope_draws[, g] <- rowMeans((upper_predictions - lower_predictions) / (2 * derivative_step))
 }
 # Average and contrast within each draw before taking posterior means and intervals.
 quantities <- tibble(Quantity = c(groups, "Within minus between"))
 level_estimates <- bind_cols(quantities,
-  summarize_columns(cbind(levels, levels[, 1] - levels[, 2])))
+  summarize_columns(cbind(mean_response_draws, mean_response_draws[, 1] - mean_response_draws[, 2])))
 estimates <- bind_cols(quantities,
-  summarize_columns(cbind(slopes, slopes[, 1] - slopes[, 2])))
-genetic_predictions_m1 <- list(shared_range = shared_range,
-  slopes = slopes, estimates = estimates, levels = levels, level_estimates = level_estimates)
-show_genetic_results(genetic_predictions_m1)
+  summarize_columns(cbind(mean_slope_draws, mean_slope_draws[, 1] - mean_slope_draws[, 2])))
+genetic_shared_range_results <- list(shared_range = shared_range,
+  slopes = mean_slope_draws, estimates = estimates, levels = mean_response_draws, level_estimates = level_estimates)
+show_genetic_results(genetic_shared_range_results)
 ```
 
 
@@ -489,106 +537,109 @@ The figure shows posterior prediction curves over the full
 distance range and where the ranges overlap.
 
 ```{r genetic-figure}
-d <- specs$m1$data
+model_data <- model_specs$m1$data
 colony_groups <- c("Within colony", "Between colonies")
-group <- ifelse(d$same_colony == 1, colony_groups[1], colony_groups[2])
-ids_m1 <- unique(round(seq(1, ndraws(fits$m1), length.out = min(2000, ndraws(fits$m1)))))
-curves_m1 <- lapply(colony_groups, function(g) {
+group <- ifelse(model_data$same_colony == 1, colony_groups[1], colony_groups[2])
+genetic_curve_draw_ids <- unique(round(seq(1, ndraws(model_fits$m1), length.out = min(2000, ndraws(model_fits$m1)))))
+genetic_curves <- lapply(colony_groups, function(g) {
   ix <- which(group == g)
-  distance <- seq(min(d$distGeo_m[ix]), max(d$distGeo_m[ix]), length.out = 100)
-  newdata <- d[rep(ix[1], length(distance)), , drop = FALSE]
-  newdata <- shift_genetic_distance(newdata, distance - newdata$distGeo_m)
+  distance_grid <- seq(min(model_data$distance_m[ix]), max(model_data$distance_m[ix]), length.out = 100)
+  newdata <- model_data[rep(ix[1], length(distance_grid)), , drop = FALSE]
+  newdata <- shift_genetic_distance(newdata, distance_grid - newdata$distance_m)
   # Expected FST integrates over residual variation; group deviations are zero.
-  mu <- posterior_linpred(fits$m1, newdata = newdata, re_formula = NA, draw_ids = ids_m1)
-  sigma <- posterior_linpred(fits$m1, newdata = newdata, dpar = "sigma",
-    transform = TRUE, re_formula = NA, draw_ids = ids_m1)
-  predictions <- mean_fst(mu, sigma)
-  bind_cols(tibble(group = g, distGeo_m = distance), summarize_columns(predictions))
+  linear_predictor_draws <- posterior_linpred(model_fits$m1, newdata = newdata, re_formula = NA, draw_ids = genetic_curve_draw_ids)
+  residual_sd_draws <- posterior_linpred(model_fits$m1, newdata = newdata, dpar = "sigma",
+    transform = TRUE, re_formula = NA, draw_ids = genetic_curve_draw_ids)
+  predictions <- mean_fst(linear_predictor_draws, residual_sd_draws)
+  bind_cols(tibble(group = g, distance_m = distance_grid), summarize_columns(predictions))
 }) |> bind_rows() |> mutate(group = factor(group, levels = colony_groups))
-rows_m1 <- tibble(group = factor(group, levels = colony_groups),
-  distGeo_m = d$distGeo_m, observed = d$FST_Latter)
-ranges <- rows_m1 |> group_by(group) |>
-  summarise(low = min(distGeo_m), high = max(distGeo_m), .groups = "drop")
+genetic_observations <- tibble(group = factor(group, levels = colony_groups),
+  distance_m = model_data$distance_m, observed = model_data$FST_Latter)
+ranges <- genetic_observations |> group_by(group) |>
+  summarise(low = min(distance_m), high = max(distance_m), .groups = "drop")
 shared_range <- c(low = max(ranges$low), high = min(ranges$high))
 
-p <- ggplot() +
-  geom_point(data = rows_m1, aes(distGeo_m, observed, colour = group),
+plot <- ggplot() +
+  geom_point(data = genetic_observations, aes(distance_m, observed, colour = group),
     alpha = .13, size = .4, show.legend = FALSE) +
-  geom_ribbon(data = curves_m1,
-    aes(distGeo_m, ymin = lower, ymax = upper, fill = group), alpha = .18, colour = NA) +
-  geom_line(data = curves_m1, aes(distGeo_m, estimate, colour = group,
+  geom_ribbon(data = genetic_curves,
+    aes(distance_m, ymin = lower, ymax = upper, fill = group), alpha = .18, colour = NA) +
+  geom_line(data = genetic_curves, aes(distance_m, estimate, colour = group,
     linetype = group), linewidth = .65)
-p <- style_genetic_plot(p, colony_groups)
-panels <- list(p + labs(title = "A   Full distance range"),
-  p + coord_cartesian(xlim = shared_range,
+plot <- style_genetic_plot(plot, colony_groups)
+panels <- list(plot + labs(title = "A   Full distance range"),
+  plot + coord_cartesian(xlim = shared_range,
     expand = c(bottom = TRUE, left = FALSE, top = TRUE, right = FALSE)) +
     labs(title = "B   Shared distance range"))
-figure_m1 <- arrange_panels(panels, width = 180, height = 98, legend_plot = p)
-save_figure("m1_distance_comparison", figure_m1, width = 180, height = 98)
+genetic_figure <- arrange_panels(panels, width = 180, height = 98, legend_plot = plot)
+save_figure("m1_distance_comparison", genetic_figure, width = 180, height = 98)
 show_figure("m1_distance_comparison", paste0(
-  "Points show observations. Posterior prediction curves show mean FST with group-specific deviations set to zero, ",
+  "Points show observations; distances use local maps within colonies and GPS between colonies. ",
+  "Posterior prediction curves show mean FST with group-specific deviations set to zero, ",
   "with posterior means and 95% credible intervals. ",
   "Each curve stops at its category's observed distance limits; the zoom shows the same curves."))
 ```
 
 We set group-specific deviations to zero because 42 of 45 between-colony combinations have no observations in the shared range. This avoids extrapolating their fitted deviations and compares the overall modelled relationships.
 
-**Interpretation.** Over the shared distance range, average FST predicted by the model with group-specific deviations set to zero was lower within colonies (0.0972; 95% credible interval 0.0820–0.1149) than between colonies (0.1273; 0.1083–0.1480). The distance-standardised within-minus-between contrast was −0.0301 (95% credible interval −0.0468 to −0.0147).
+**Interpretation.** Over the shared distance range, average FST predicted by the model with group-specific deviations set to zero was lower within colonies (0.0986; 95% credible interval 0.0833–0.1162) than between colonies (0.1302; 0.1112–0.1518). The distance-standardised within-minus-between contrast was −0.0316 (95% credible interval −0.0490 to −0.0154).
 
-Over the same range, predicted differentiation increased with distance within colonies (average local slope 0.00023 FST per metre; 95% credible interval 0.00005–0.00041). Between colonies, the slope was small and its direction uncertain (0.00002 FST per metre; 95% credible interval −0.00002 to 0.00005). The within-minus-between slope contrast was 0.00021 FST per metre (95% credible interval 0.00003–0.00040).
+Over the same range, the within-colony slope was positive on average but uncertain (average local slope 0.00018 FST per metre; 95% credible interval −0.00004 to 0.00043). Between colonies, the slope was small and its direction uncertain (0.00002 FST per metre; 95% credible interval −0.00001 to 0.00005). The within-minus-between slope contrast was also uncertain (0.00016 FST per metre; 95% credible interval −0.00006 to 0.00041).
+
 
 ### Additional description: full range for the sampled pairs
 
 These results use each category's full observed distance range, retaining fitted nest, colony and colony-pair effects (rather than comparing over the shared distance range, requiring the group effects to be held at zero).
 
 ```{r genetic-full-range-results}
-d <- specs$m1$data
+model_data <- model_specs$m1$data
 groups <- c("Within colony", "Between colonies")
-group <- ifelse(d$same_colony == 1, groups[1], groups[2])
-ids_full_m1 <- seq_len(ndraws(fits$m1))
-step <- .01
+group <- ifelse(model_data$same_colony == 1, groups[1], groups[2])
+genetic_full_range_draw_ids <- seq_len(ndraws(model_fits$m1))
+derivative_step <- .01
 # Sum over every observed pair in batches, retaining its fitted group effects.
-sums <- genetic_row_sums(fits$m1, specs$m1, step = step,
-  ids = ids_full_m1, re_formula = NULL)
+prediction_sums <- genetic_row_sums(model_fits$m1, model_specs$m1, derivative_step = derivative_step,
+  draw_ids = genetic_full_range_draw_ids, re_formula = NULL)
 counts <- vapply(groups, function(g) sum(group == g), integer(1))
-levels <- sweep(sums$level_sums, 2, counts, "/")
-slopes <- sweep(sums$slope_sums, 2, counts, "/")
+mean_response_draws <- sweep(prediction_sums$level_sums, 2, counts, "/")
+mean_slope_draws <- sweep(prediction_sums$slope_sums, 2, counts, "/")
 quantities <- tibble(Quantity = c(groups, "Within minus between"),
   Pairs = c(unname(counts), NA_integer_))
 level_estimates <- bind_cols(quantities,
-  summarize_columns(cbind(levels, levels[, 1] - levels[, 2])))
+  summarize_columns(cbind(mean_response_draws, mean_response_draws[, 1] - mean_response_draws[, 2])))
 estimates <- bind_cols(quantities,
-  summarize_columns(cbind(slopes, slopes[, 1] - slopes[, 2])))
-genetic_full_range_m1 <- list(slopes = slopes, estimates = estimates,
-  levels = levels, level_estimates = level_estimates)
+  summarize_columns(cbind(mean_slope_draws, mean_slope_draws[, 1] - mean_slope_draws[, 2])))
+genetic_full_range_results <- list(slopes = mean_slope_draws, estimates = estimates,
+  levels = mean_response_draws, level_estimates = level_estimates)
 ```
 
-**Interpretation.** Average FST predicted by the model was lower within colonies (0.0999; 95% credible interval 0.0978–0.1022) than between colonies (0.1339; 0.1332–0.1346). The within-minus-between contrast was −0.0340 (95% credible interval −0.0361 to −0.0315).
+**Interpretation.** Average FST predicted by the model was lower within colonies (0.1045; 95% credible interval 0.1020–0.1071) than between colonies (0.1376; 0.1368–0.1384). The within-minus-between contrast was −0.0331 (95% credible interval −0.0357 to −0.0304).
 
-Over these full ranges, predicted differentiation increased with distance within colonies (average local slope 0.00023 FST per metre; 95% credible interval 0.00005–0.00040). Between colonies, the slope was small and its direction uncertain (−0.00003 FST per metre; 95% credible interval −0.00009 to 0.00003). The within-minus-between slope contrast was 0.00026 FST per metre (95% credible interval 0.00007–0.00044).
+Over these full ranges, the within-colony slope was positive on average but uncertain (average local slope 0.00019 FST per metre; 95% credible interval −0.00004 to 0.00043). Between colonies, the slope was small and its direction uncertain (−0.00004 FST per metre; 95% credible interval −0.00011 to 0.00003). The within-minus-between slope contrast was also uncertain (0.00023 FST per metre; 95% credible interval −0.00001 to 0.00047).
+
 
 ## Posterior predictive checks
 
 ```{r m1-posterior-predictive}
 set.seed(seed + 100L)
-d <- specs$m1$data
-ids <- unique(round(seq(1, ndraws(fits$m1), length.out = 400)))
+model_data <- model_specs$m1$data
+draw_ids <- unique(round(seq(1, ndraws(model_fits$m1), length.out = 400)))
 # Replicate the fitted rows, retaining fitted group effects and response noise.
-yr <- posterior_predict(fits$m1, re_formula = NULL, draw_ids = ids)
-y <- plogis(d$response)
-yr <- plogis(yr)
-posterior_by_model$m1 <- posterior_predictive_summary(y, yr, "m1",
+replicated_outcomes <- posterior_predict(model_fits$m1, re_formula = NULL, draw_ids = draw_ids)
+observed_outcomes <- plogis(model_data$response)
+replicated_outcomes <- plogis(replicated_outcomes)
+predictive_checks$m1 <- posterior_predictive_summary(observed_outcomes, replicated_outcomes, "m1",
   list(minimum = min, median = median, maximum = max, sd = sd))
 # Check distance quartiles separately within and between colonies.
-bins <- d |>
+bins <- model_data |>
   mutate(category = ifelse(same_colony, "Within", "Between")) |>
   group_by(category) |>
-  mutate(bin = ntile(distGeo_m, 4)) |>
+  mutate(bin = ntile(distance_m, 4)) |>
   ungroup()
 strata <- list(distance = paste(bins$category, "distance quartile", bins$bin))
-show_table(posterior_group_checks(y, yr, strata),
+show_table(posterior_group_checks(observed_outcomes, replicated_outcomes, strata),
   caption = "Posterior predictive checks of group means")
-show_table(posterior_by_model$m1, digits = 4)
+show_table(predictive_checks$m1, digits = 4)
 ```
 
 Observed and replicated residuals use the same posterior draw of the mean
@@ -597,41 +648,40 @@ replicated skewness is larger.
 
 ```{r genetic-distribution-checks}
 set.seed(seed + 402L)
-d <- specs$m1$data
-ids <- unique(round(seq(1, ndraws(fits$m1), length.out = 400L)))
-zr <- posterior_predict(fits$m1, re_formula = NULL, draw_ids = ids)
-mu <- posterior_linpred(fits$m1, re_formula = NULL, draw_ids = ids)
-sigma <- posterior_linpred(fits$m1, dpar = "sigma", transform = TRUE,
-  re_formula = NULL, draw_ids = ids)
-genetic_distribution <- genetic_predictive_summary(zr, mu, sigma, d, "m1")
-y <- plogis(d$response)
-yr <- plogis(zr)
-groups <- split(seq_len(nrow(d)), ifelse(d$same_colony == 1, "Within", "Between"))
+model_data <- model_specs$m1$data
+draw_ids <- unique(round(seq(1, ndraws(model_fits$m1), length.out = 400L)))
+replicated_logit_fst <- posterior_predict(model_fits$m1, re_formula = NULL, draw_ids = draw_ids)
+linear_predictor_draws <- posterior_linpred(model_fits$m1, re_formula = NULL, draw_ids = draw_ids)
+residual_sd_draws <- posterior_linpred(model_fits$m1, dpar = "sigma", transform = TRUE,
+  re_formula = NULL, draw_ids = draw_ids)
+genetic_distribution <- genetic_predictive_summary(replicated_logit_fst, linear_predictor_draws, residual_sd_draws, model_data, "m1")
+observed_outcomes <- plogis(model_data$response)
+replicated_outcomes <- plogis(replicated_logit_fst)
+groups <- split(seq_len(nrow(model_data)), ifelse(model_data$same_colony == 1, "Within", "Between"))
 plots <- imap(groups, function(ii, group) {
-  bayesplot::ppc_dens_overlay(y[ii], yr[seq_len(min(50, nrow(yr))), ii, drop = FALSE]) +
+  bayesplot::ppc_dens_overlay(observed_outcomes[ii], replicated_outcomes[seq_len(min(50, nrow(replicated_outcomes))), ii, drop = FALSE]) +
     labs(title = paste(group, "colonies"), x = expression("Latter " * F[ST]), y = "Density")
 })
-p <- arrange_panels(plots[c("Within", "Between")], width = 180, height = 85, align_widths = TRUE)
-save_figure("m1_ppc_distributions", p, width = 180, height = 85)
+plot <- arrange_panels(plots[c("Within", "Between")], width = 180, height = 85, align_widths = TRUE)
+save_figure("m1_ppc_distributions", plot, width = 180, height = 85)
 show_table(genetic_distribution, digits = 4)
 show_figure("m1_ppc_distributions",
   "Observed FST distributions (dark lines) and posterior replications (light lines), within and between colonies.")
 ```
 
+
 # Model 2: Trail presence {#model-presence}
 
 **Question and interpretation.** How does trail probability vary with distance, genetic differentiation and food difference within colonies? Including present and absent trails avoids selection on presence. Food difference is biologically motivated but not an established confounder. Genetic differentiation could influence trail formation or record past connectivity. If it mediates a distance effect, adjusting for it blocks that pathway: the distance association would not estimate a total causal effect.
 
-**Data.** There are 650 within-colony pairs from 105 nests in ten colonies:
-85 observed trails and 565 confirmed absences. Of 667 known within-colony pairs,
+**Data.** There are 645 within-colony pairs from 104 nests in ten colonies:
+84 observed trails and 561 confirmed absences. Of 662 screened within-colony pairs,
 17 were excluded because one nest lacked the population estimate needed for
 the food predictor. No additional pairs were excluded for other missing measurements.
 
 ## Shared definitions for the trail models {#trail-definitions}
 
-Both trail models exclude 10,725 pairs with unknown colony membership and
-4,898 between-colony pairs, leaving 667 known within-colony pairs before
-measurement exclusions. $T_i$ indicates trail presence;
+Both trail models use screened within-colony pairs; 4,798 between-colony pairs are outside their scope, leaving 662 pairs before measurement exclusions. $T_i$ indicates trail presence;
 unlisted trails are absences only in the completely surveyed colonies. Let
 $Q_j$ be nest $j$'s summed outgoing foraging strength (ants/cm) and $N_j$ its
 estimated population (ants). Monitored nests without foraging trails have zero
@@ -646,11 +696,12 @@ observed income. Food difference and investment are defined in the data processi
 where $\lambda_i$ is trail strength (ants/cm) and $L_i$ local straight-line
 length (cm). $H_i$ has units cm$^{-1}$; $I_i$ is dimensionless but not bounded
 as a literal population fraction. Investment requires observed trails with
-finite positive investment and nest sizes. Geographic distance $D_i$ (metres)
-is distinct from $L_i$.
+finite positive investment and nest sizes. Both trail models use local-map
+separation as the distance predictor, so $D_i=L_i/100$ in metres.
 
-We subtracted each predictor's mean and divided by its sample SD, using the
-eligible trail-presence dataset. The resulting predictors are $z_{D,i}$
+To preserve the calibrated prior scales, local distance uses the mean GPS distance
+and its sample SD from the eligible trail-presence dataset before genetic screening.
+Genetic and food predictors retain their means and SDs from that same reference dataset. The resulting predictors are $z_{D,i}$
 (distance), $z_{F,i}$ (Latter FST) and $z_{H,i}$ (food difference). The scaling
 values are shown below and reused without rounding for investment and
 robustness fits.
@@ -668,8 +719,8 @@ correlated colony random effects: baseline and log decline magnitude in Model 2,
 and baseline and distance slope in Model 3.
 
 ```{r trail-transformations}
-transformations <- make_trail_transformations(analysis_data)
-show_table(transformations, digits = 6, caption = "Shared trail-predictor transformations")
+trail_transformations <- make_trail_transformations(processed_data$analysis_data)
+show_table(trail_transformations, digits = 6, caption = "Shared trail-predictor transformations")
 ```
 
 ## Model formulation
@@ -702,35 +753,38 @@ Between-colony pairs do not enter as structural absences.
 ## Specify the model
 
 ```{r m2-specification}
-data_m2 <- apply_trail_scales(analysis_data$m2, transformations)
-prior_m2 <- list(
+presence_data <- apply_trail_scales(analysis_data$m2, trail_transformations)
+presence_prior_settings <- list(
   intercept = c(-2, 1.5), slope_sd = 1, distance_sd = 3,
   genetic_sd = 1, food_sd = 1, group_rate = 2, correlation = 2
 )
-data_m2$response <- as.integer(data_m2$connected)
-stopifnot(setequal(unique(data_m2$response), c(0, 1)))
+presence_data$response <- as.integer(presence_data$connected)
+stopifnot(setequal(unique(presence_data$response), c(0, 1)))
 
-# Every colony's distance slope is -magnitude * exp(variation).
+# Every colony's distance slope is -distanceDecline * exp(logColonyMultiplier).
+# Baseline log odds include genetic, food, nest and colony effects.
 # Colony baselines and log steepness can covary; nest effects are summed.
-formula_m2 <- bf(response ~ eta - magnitude * exp(variation) * distance_z,
-  eta ~ 0 + Intercept + fst_z + food_z + (1 | col | colony) +
+presence_formula <- bf(
+  response ~ baselineLogOdds - distanceDecline * exp(logColonyMultiplier) * distance_z,
+  baselineLogOdds ~ 0 + Intercept + fst_z + food_z + (1 | colonyEffects | colony) +
     (1 | mm(from_label, to_label, weights = cbind(w1, w2), scale = FALSE)),
-  magnitude ~ 1, variation ~ 0 + (1 | col | colony), nl = TRUE)
-priors_m2 <- c(
-  set_prior(normal_prior(prior_m2$intercept[1], prior_m2$intercept[2]),
-    class = "b", coef = "Intercept", nlpar = "eta"),
-  set_prior(normal_prior(0, prior_m2$genetic_sd), class = "b", coef = "fst_z", nlpar = "eta"),
-  set_prior(normal_prior(0, prior_m2$food_sd), class = "b", coef = "food_z", nlpar = "eta"),
-  set_prior(normal_prior(0, prior_m2$distance_sd), class = "b", nlpar = "magnitude", lb = 0),
-  set_prior(sprintf("exponential(%g)", prior_m2$group_rate), class = "sd", nlpar = "eta"),
-  set_prior(sprintf("exponential(%g)", prior_m2$group_rate), class = "sd", nlpar = "variation"),
-  set_prior(sprintf("lkj(%g)", prior_m2$correlation), class = "cor")
+  distanceDecline ~ 1,
+  logColonyMultiplier ~ 0 + (1 | colonyEffects | colony), nl = TRUE)
+presence_priors <- c(
+  set_prior(normal_prior(presence_prior_settings$intercept[1], presence_prior_settings$intercept[2]),
+    class = "b", coef = "Intercept", nlpar = "baselineLogOdds"),
+  set_prior(normal_prior(0, presence_prior_settings$genetic_sd), class = "b", coef = "fst_z", nlpar = "baselineLogOdds"),
+  set_prior(normal_prior(0, presence_prior_settings$food_sd), class = "b", coef = "food_z", nlpar = "baselineLogOdds"),
+  set_prior(normal_prior(0, presence_prior_settings$distance_sd), class = "b", nlpar = "distanceDecline", lb = 0),
+  set_prior(sprintf("exponential(%g)", presence_prior_settings$group_rate), class = "sd", nlpar = "baselineLogOdds"),
+  set_prior(sprintf("exponential(%g)", presence_prior_settings$group_rate), class = "sd", nlpar = "logColonyMultiplier"),
+  set_prior(sprintf("lkj(%g)", presence_prior_settings$correlation), class = "cor")
 )
-specs$m2 <- list(
-  name = "m2", formula = formula_m2, data = data_m2, prior = priors_m2, prior_parameters = prior_m2,
+model_specs$m2 <- list(
+  name = "m2", formula = presence_formula, data = presence_data, prior = presence_priors, prior_parameters = presence_prior_settings,
   family = bernoulli("logit"), response_scale = "bernoulli"
 )
-specs$m2$formula
+model_specs$m2$formula
 ```
 
 ## Priors and prior predictions
@@ -741,37 +795,37 @@ We assumed that greater distance cannot increase trail probability within a colo
 # Expected-response curves: 100 draws, with group deviations set to zero.
 set.seed(seed + 703L)
 draws <- 100L
-d <- specs$m2$data
-pr <- specs$m2$prior_parameters
-a <- rnorm(draws, pr$intercept[1], pr$intercept[2])
-b <- cbind(rnorm(draws, 0, pr$slope_sd), rnorm(draws, 0, pr$genetic_sd),
-  rnorm(draws, 0, pr$food_sd))
+model_data <- model_specs$m2$data
+prior_settings <- model_specs$m2$prior_parameters
+intercept_draws <- rnorm(draws, prior_settings$intercept[1], prior_settings$intercept[2])
+coefficient_draws <- cbind(rnorm(draws, 0, prior_settings$slope_sd), rnorm(draws, 0, prior_settings$genetic_sd),
+  rnorm(draws, 0, prior_settings$food_sd))
 # The distance effect is non-positive, with most prior weight near zero.
-b[, 1] <- -abs(b[, 1]) * pr$distance_sd / pr$slope_sd
-variables <- c("distGeo_m", "FST_Latter", "food_difference")
-z <- as.matrix(d[, c("distance_z", "fst_z", "food_z")])
-prior_curves_m2 <- setNames(lapply(seq_along(variables), function(j) {
-  x <- seq(min(d[[variables[j]]]), max(d[[variables[j]]]), length.out = 80L)
-  scale <- transformations[match(variables[j], transformations$variable), ]
-  grid_z <- (x - scale$center) / scale$scale
-  other <- a + b[, -j, drop = FALSE] %*% t(z[, -j, drop = FALSE])
+coefficient_draws[, 1] <- -abs(coefficient_draws[, 1]) * prior_settings$distance_sd / prior_settings$slope_sd
+variables <- c("distance_m", "FST_Latter", "food_difference")
+standardized_predictors <- as.matrix(model_data[, c("distance_z", "fst_z", "food_z")])
+presence_prior_curves <- setNames(lapply(seq_along(variables), function(j) {
+  x <- seq(min(model_data[[variables[j]]]), max(model_data[[variables[j]]]), length.out = 80L)
+  predictor_scaling <- trail_transformations[match(variables[j], trail_transformations$variable), ]
+  grid_z <- (x - predictor_scaling$center) / predictor_scaling$scale
+  other_predictor_contribution <- intercept_draws + coefficient_draws[, -j, drop = FALSE] %*% t(standardized_predictors[, -j, drop = FALSE])
   y <- vapply(grid_z, function(value) {
-    mu <- other + b[, j] * value
-    rowMeans(plogis(mu))
+    linear_predictor_draws <- other_predictor_contribution + coefficient_draws[, j] * value
+    rowMeans(plogis(linear_predictor_draws))
   }, numeric(draws))
   long_prior_draws(x, y)
 }), variables)
 y_range <- c(0, 1)
 panels <- lapply(seq_along(variables), function(j) {
   variable <- variables[j]
-  p <- ggplot(prior_curves_m2[[j]], aes(x, y, group = draw)) +
+  plot <- ggplot(presence_prior_curves[[j]], aes(x, y, group = draw)) +
     geom_line(colour = "#0072B2", alpha = .2, linewidth = .22) +
-    geom_point(data = tibble(x = d[[variable]], y = d$response), aes(x, y),
+    geom_point(data = tibble(x = model_data[[variable]], y = model_data$response), aes(x, y),
       inherit.aes = FALSE, colour = "#222222", alpha = .4, size = .6)
-  style_prior_panel(p, variable, j, genetic = FALSE, investment = FALSE, y_range = y_range)
+  style_prior_panel(plot, variable, j, genetic = FALSE, investment = FALSE, y_range = y_range)
 })
-p <- arrange_panels(panels, width = 180, height = 94)
-save_figure("m2_prior_trends", p, width = 180, height = 94)
+plot <- arrange_panels(panels, width = 180, height = 94)
+save_figure("m2_prior_trends", plot, width = 180, height = 94)
 show_figure("m2_prior_trends", paste0(
   "100 prior-drawn response curves per panel; points are observations for reference. ",
   "Group-specific deviations are zero. ",
@@ -781,18 +835,18 @@ show_figure("m2_prior_trends", paste0(
 
 # Full prior predictions include shared group effects and observation noise.
 set.seed(seed + 22L)
-prior_sim_m2 <- simulate_prior(specs$m2, draws = 4000L)
-yrep <- prior_sim_m2$yrep
-prior_summary_m2 <- tibble(`Trail prevalence` = rowMeans(yrep))
-pp <- prior_summary_m2 |> pivot_longer(everything(), names_to = "statistic", values_to = "value") |>
-  mutate(statistic = factor(statistic, levels = names(prior_summary_m2)))
-p <- ggplot(pp, aes(value)) +
+presence_prior_simulation <- simulate_prior(model_specs$m2, draws = 4000L)
+replicated_outcomes <- presence_prior_simulation$yrep
+presence_prior_summary <- tibble(`Trail prevalence` = rowMeans(replicated_outcomes))
+prior_summary_long <- presence_prior_summary |> pivot_longer(everything(), names_to = "statistic", values_to = "value") |>
+  mutate(statistic = factor(statistic, levels = names(presence_prior_summary)))
+plot <- ggplot(prior_summary_long, aes(value)) +
   geom_histogram(bins = 35, fill = "#0072B2", colour = "white", linewidth = .15) +
   facet_wrap(~statistic, scales = "free_x") +
   labs(x = "Fraction of eligible pairs connected", y = "Simulations", title = model_label("m2"))
-save_figure("m2_prior", p, width = 180, height = 80)
+save_figure("m2_prior", plot, width = 180, height = 80)
 show_figure("m2_prior", paste(4000,
-  "simulations include all group effects and response noise, using", nrow(prior_sim_m2$data),
+  "simulations include all group effects and response noise, using", nrow(presence_prior_simulation$data),
   "evenly spaced design rows. Each value summarises one simulated dataset."))
 ```
 
@@ -803,23 +857,23 @@ show_figure("m2_prior", paste(4000,
 ```{r m2-fit}
 sampling_dir <- tempfile("wood-ant-sampling-")
 dir.create(sampling_dir)
-fits$m2 <- brm(
-  formula = specs$m2$formula, data = specs$m2$data,
-  family = specs$m2$family, prior = specs$m2$prior,
+model_fits$m2 <- brm(
+  formula = model_specs$m2$formula, data = model_specs$m2$data,
+  family = model_specs$m2$family, prior = model_specs$m2$prior,
   backend = "cmdstanr", chains = 4, cores = 4,
-  iter = 5000L, warmup = 2000L, seed = seed, init = NULL,
+  iter = 5000L, warmup = 2000L, seed = 20261021L, init = NULL,
   control = list(adapt_delta = .995, max_treedepth = 13, metric = "diag_e"),
   save_pars = save_pars(all = TRUE), output_dir = sampling_dir,
   refresh = 200, silent = 1
 )
-fits$m2 <- refine_sampling_fit(fits$m2, seed, sampling_dir)
+model_fits$m2 <- refine_sampling_fit(model_fits$m2, 20261021L, sampling_dir)
 ```
 
 
 ```{r m2-sampling}
-diagnostics_m2 <- diagnose_fit(fits$m2, "m2")
-show_table(diagnostics_m2)
-stopifnot(all(diagnostics_m2$pass))
+presence_diagnostics <- diagnose_fit(model_fits$m2, "m2")
+show_table(presence_diagnostics)
+stopifnot(all(presence_diagnostics$pass))
 ```
 
 ## Results {#presence-results}
@@ -828,7 +882,7 @@ Trail effect tables instead average local slopes at every analysed pair's
 observed predictor values, retaining its other predictors and fitted group
 effects and giving each pair equal weight within each posterior draw.
 
-Trail effects use all 650 presence pairs and all 85 existing trails for
+Trail effects use all 645 presence pairs and all 84 existing trails for
 investment. We report local rates per metre, per 0.01 FST and per 0.0001/cm
 food difference, in percentage points for presence and the dimensionless
 investment index for investment. These units rescale slopes; they do not imply
@@ -841,39 +895,39 @@ zero indicates no local association. The distance-band table shows where
 probability falls most rapidly.
 
 ```{r presence-results}
-d <- specs$m2$data
-ids_results_m2 <- seq_len(ndraws(fits$m2))
+model_data <- model_specs$m2$data
+presence_result_draw_ids <- seq_len(ndraws(model_fits$m2))
 ame_settings <- tibble(
-  variable = c("distGeo_m", "FST_Latter", "food_difference"),
-  unit = c(1, .01, .0001), step = c(.01, 1e-5, 1e-7),
+  variable = c("distance_m", "FST_Latter", "food_difference"),
+  unit = c(1, .01, .0001), derivative_step = c(.01, 1e-5, 1e-7),
   label = c("Distance (per m)", "FST (per 0.01)", "Food-income difference (per 0.0001/cm)")
 )
 # Local response-scale slopes retain every observed pair and its fitted group effects.
-ame_draws_m2 <- lapply(seq_len(nrow(ame_settings)), function(j) {
-  local <- trail_local_slopes(fits$m2, specs$m2, transformations,
-    variable = ame_settings$variable[j], step = ame_settings$step[j], ids = ids_results_m2)
+presence_marginal_effect_draws <- lapply(seq_len(nrow(ame_settings)), function(j) {
+  local_slopes <- trail_local_slopes(model_fits$m2, model_specs$m2, trail_transformations,
+    variable = ame_settings$variable[j], derivative_step = ame_settings$derivative_step[j], draw_ids = presence_result_draw_ids)
   # Percentage points per stated unit, averaged within each posterior draw.
-  100 * ame_settings$unit[j] * rowMeans(local)
+  100 * ame_settings$unit[j] * rowMeans(local_slopes)
 })
-ame_draws_m2 <- do.call(cbind, ame_draws_m2)
-colnames(ame_draws_m2) <- ame_settings$variable
-effects_m2 <- list(estimates = bind_cols(
-  tibble(Predictor = ame_settings$label, Pairs = nrow(d)), summarize_columns(ame_draws_m2)),
-  draws = ame_draws_m2)
-show_trail_results(effects_m2, presence = TRUE)
+presence_marginal_effect_draws <- do.call(cbind, presence_marginal_effect_draws)
+colnames(presence_marginal_effect_draws) <- ame_settings$variable
+presence_effects <- list(estimates = bind_cols(
+  tibble(Predictor = ame_settings$label, Pairs = nrow(model_data)), summarize_columns(presence_marginal_effect_draws)),
+  draws = presence_marginal_effect_draws)
+show_trail_results(presence_effects, presence = TRUE)
 
 # Distance-band summaries use the same local derivatives, in percentage points per metre.
-step <- .01
-stopifnot(specs$m2$response_scale == "bernoulli", is.finite(step), step > 0,
-  all(is.finite(d$distGeo_m)), all(d$distGeo_m > step))
-local <- 100 * trail_local_slopes(fits$m2, specs$m2, transformations,
-  "distGeo_m", step = step, ids = ids_results_m2)
-band <- cut(d$distGeo_m, c(-Inf, 20, 30, Inf),
+derivative_step <- .01
+stopifnot(model_specs$m2$response_scale == "bernoulli", is.finite(derivative_step), derivative_step > 0,
+  all(is.finite(model_data$distance_m)), all(model_data$distance_m > derivative_step))
+local_slopes <- 100 * trail_local_slopes(model_fits$m2, model_specs$m2, trail_transformations,
+  "distance_m", derivative_step = derivative_step, draw_ids = presence_result_draw_ids)
+distance_band <- cut(model_data$distance_m, c(-Inf, 20, 30, Inf),
   labels = c("Up to 20 m", "Over 20 to 30 m", "Over 30 m"))
-rows <- c(list("All pairs" = seq_len(nrow(d))), split(seq_len(nrow(d)), band))
-stopifnot(sum(lengths(rows[-1])) == nrow(d), all(lengths(rows) > 0L))
-band_draws <- vapply(rows, function(ix) rowMeans(local[, ix, drop = FALSE]),
-  numeric(length(ids_results_m2)))
+rows <- c(list("All pairs" = seq_len(nrow(model_data))), split(seq_len(nrow(model_data)), distance_band))
+stopifnot(sum(lengths(rows[-1])) == nrow(model_data), all(lengths(rows) > 0L))
+band_draws <- vapply(rows, function(ix) rowMeans(local_slopes[, ix, drop = FALSE]),
+  numeric(length(presence_result_draw_ids)))
 presence_slopes <- list(estimates = bind_cols(
   tibble(`Observed distance` = names(rows), Pairs = lengths(rows)), summarize_columns(band_draws)),
   draws = band_draws)
@@ -882,47 +936,47 @@ show_presence_distance_slopes(presence_slopes)
 
 
 ```{r presence-figures}
-d <- specs$m2$data
-variables <- c("distGeo_m", "FST_Latter", "food_difference")
-ids_m2 <- unique(round(seq(1, ndraws(fits$m2), length.out = min(2000, ndraws(fits$m2)))))
-curves_m2 <- setNames(lapply(variables, function(variable) {
-  x <- d[[variable]]
+model_data <- model_specs$m2$data
+variables <- c("distance_m", "FST_Latter", "food_difference")
+presence_curve_draw_ids <- unique(round(seq(1, ndraws(model_fits$m2), length.out = min(2000, ndraws(model_fits$m2)))))
+presence_curves <- setNames(lapply(variables, function(variable) {
+  x <- model_data[[variable]]
   values <- seq(min(x), max(x), length.out = 100)
   # Process ten grid values at a time, retaining every pair and its other predictors.
   batches <- split(seq_along(values), ceiling(seq_along(values) / 10))
   predictions <- lapply(batches, function(ix) {
-    newdata <- trail_prediction_data(d, transformations, variable, values[ix])
-    ep <- posterior_epred(fits$m2, newdata = newdata,
-      re_formula = NA, draw_ids = ids_m2)
+    newdata <- trail_prediction_data(model_data, trail_transformations, variable, values[ix])
+    expected_draws <- posterior_epred(model_fits$m2, newdata = newdata,
+      re_formula = NA, draw_ids = presence_curve_draw_ids)
     vapply(seq_along(ix), function(j) {
-      rowMeans(ep[, (j - 1L) * nrow(d) + seq_len(nrow(d)), drop = FALSE])
-    }, numeric(nrow(ep)))
+      rowMeans(expected_draws[, (j - 1L) * nrow(model_data) + seq_len(nrow(model_data)), drop = FALSE])
+    }, numeric(nrow(expected_draws)))
   })
   bind_cols(tibble(x = values), summarize_columns(do.call(cbind, predictions)))
 }), variables)
-y_range <- range(d$response, unlist(lapply(curves_m2, function(x) c(x$lower, x$upper))))
+y_range <- range(model_data$response, unlist(lapply(presence_curves, function(x) c(x$lower, x$upper))))
 
 panels <- lapply(seq_along(variables), function(j) {
   variable <- variables[j]
-  p <- ggplot() +
-    geom_ribbon(data = curves_m2[[variable]], aes(x, ymin = lower, ymax = upper),
+  plot <- ggplot() +
+    geom_ribbon(data = presence_curves[[variable]], aes(x, ymin = lower, ymax = upper),
       fill = "#0072B2", alpha = .16) +
-    geom_point(data = d, aes(x = .data[[variable]], y = response),
+    geom_point(data = model_data, aes(x = .data[[variable]], y = response),
       colour = "#555555", alpha = .2, size = .6) +
-    geom_line(data = curves_m2[[variable]], aes(x, estimate), colour = "#0072B2", linewidth = .65)
-  style_trail_panel(p, variable, j, presence = TRUE, y_range = y_range)
+    geom_line(data = presence_curves[[variable]], aes(x, estimate), colour = "#0072B2", linewidth = .65)
+  style_trail_panel(plot, variable, j, presence = TRUE, y_range = y_range)
 })
-figure_m2 <- arrange_panels(panels, width = 180, height = 82)
-save_figure("m2_effects", figure_m2, width = 180, height = 82)
+presence_figure <- arrange_panels(panels, width = 180, height = 82)
+save_figure("m2_effects", presence_figure, width = 180, height = 82)
 show_figure("m2_effects", paste0(
-  "Points show all ", nrow(d), " observed pairs. Posterior prediction curves show ",
+  "Points show all ", nrow(model_data), " observed pairs. Posterior prediction curves show ",
   "mean trail probability with group-specific deviations set to zero, with posterior means and 95% credible intervals. ",
   "Other predictors retain their observed values, averaged over all analysed pairs within each draw. ",
   "Each curve stops at the observed predictor limits. ",
   "Food difference is shown in units of 0.0001 per centimetre."))
 ```
 
-**Interpretation.** Under the non-positive distance prior, trail probability declined at an average local rate of 1.66 percentage points per metre (95% credible interval 1.32–2.01), accounting for the other predictors and group effects. The decline was steepest among pairs up to 20 m apart (2.72 percentage points per metre), falling to 0.42 at 20–30 m and 0.04 beyond 30 m. Genetic and food associations were uncertain; their intervals included local increases and decreases in probability.
+**Interpretation.** Under the non-positive distance prior, trail probability declined at an average local rate of 1.79 percentage points per metre (95% credible interval 1.42–2.17), accounting for the other predictors and group effects. The decline was steepest among pairs up to 20 m apart (2.63 percentage points per metre), falling to 0.33 at 20–30 m and 0.04 beyond 30 m. Genetic and food associations were uncertain; their intervals included local increases and decreases in probability.
 
 Food income and trail structure may influence each other;
 these associations do not establish that changing food availability would
@@ -932,18 +986,18 @@ create or remove trails.
 
 ```{r m2-posterior-predictive}
 set.seed(seed + 300L)
-d <- specs$m2$data
-ids <- unique(round(seq(1, ndraws(fits$m2), length.out = 400)))
-yr <- posterior_predict(fits$m2, re_formula = NULL, draw_ids = ids)
-y <- d$response
-posterior_by_model$m2 <- posterior_predictive_summary(y, yr, "m2", list(prevalence = mean))
+model_data <- model_specs$m2$data
+draw_ids <- unique(round(seq(1, ndraws(model_fits$m2), length.out = 400)))
+replicated_outcomes <- posterior_predict(model_fits$m2, re_formula = NULL, draw_ids = draw_ids)
+observed_outcomes <- model_data$response
+predictive_checks$m2 <- posterior_predictive_summary(observed_outcomes, replicated_outcomes, "m2", list(prevalence = mean))
 strata <- list(
-  colony = as.character(d$colony),
-  distance = paste("Distance quartile", dplyr::ntile(d$distGeo_m, 4))
+  colony = as.character(model_data$colony),
+  distance = paste("Distance quartile", dplyr::ntile(model_data$distance_m, 4))
 )
-show_table(posterior_group_checks(y, yr, strata),
+show_table(posterior_group_checks(observed_outcomes, replicated_outcomes, strata),
   caption = "Posterior predictive checks of group means")
-show_table(posterior_by_model$m2, digits = 4)
+show_table(predictive_checks$m2, digits = 4)
 ```
 
 Trail prevalence and all 14 colony/distance means fall within their 95%
@@ -957,16 +1011,16 @@ refits presence with WC84, retaining Latter's predictor scaling. Preprocessing
 compares all three estimators.
 
 ```{r presence-robustness}
-robustness_specs$m2_WC84 <- specs$m2
-robustness_specs$m2_WC84$name <- "m2_WC84"
-robustness_specs$m2_WC84$data <- apply_trail_scales(
-  analysis_data$m2, transformations, "FST_WC84")
-robustness_specs$m2_WC84$data$response <- as.integer(robustness_specs$m2_WC84$data$connected)
+robustness_model_specs$m2_WC84 <- model_specs$m2
+robustness_model_specs$m2_WC84$name <- "m2_WC84"
+robustness_model_specs$m2_WC84$data <- apply_trail_scales(
+  analysis_data$m2, trail_transformations, "FST_WC84")
+robustness_model_specs$m2_WC84$data$response <- as.integer(robustness_model_specs$m2_WC84$data$connected)
 sampling_dir <- tempfile("wood-ant-sampling-")
 dir.create(sampling_dir)
 robustness_fits$m2_WC84 <- brm(
-  formula = robustness_specs$m2_WC84$formula, data = robustness_specs$m2_WC84$data,
-  family = robustness_specs$m2_WC84$family, prior = robustness_specs$m2_WC84$prior,
+  formula = robustness_model_specs$m2_WC84$formula, data = robustness_model_specs$m2_WC84$data,
+  family = robustness_model_specs$m2_WC84$family, prior = robustness_model_specs$m2_WC84$prior,
   backend = "cmdstanr", chains = 4, cores = 4,
   iter = 5000L, warmup = 2000L, seed = seed, init = NULL,
   control = list(adapt_delta = .995, max_treedepth = 13, metric = "diag_e"),
@@ -978,18 +1032,19 @@ diagnostics_m2_WC84 <- diagnose_fit(robustness_fits$m2_WC84, "m2_WC84")
 show_table(diagnostics_m2_WC84)
 stopifnot(all(diagnostics_m2_WC84$pass))
 show_genetic_robustness(
-  c(fits["m2"], robustness_fits["m2_WC84"]),
-  c(specs["m2"], robustness_specs["m2_WC84"]), transformations)
+  c(model_fits["m2"], robustness_fits["m2_WC84"]),
+  c(model_specs["m2"], robustness_model_specs["m2_WC84"]), trail_transformations)
 ```
 
 The genetic association remains uncertain with either estimator: both intervals
 include increases and decreases in trail probability.
 
+
 # Model 3: Trail investment {#model-investment}
 
 This model uses the [shared trail definitions and transformations](#trail-definitions) above.
 
-**Data.** Of 667 known within-colony pairs, 86 had observed trails and 581 had no trail. One observed trail was excluded because a missing nest-size measurement prevented calculation of food difference and investment. The analysis therefore included 85 trails joining 95 nests in ten colonies. No additional trails were excluded for missing or invalid measurements.
+**Data.** Of 662 screened within-colony pairs, 85 had observed trails and 577 had no trail. One observed trail was excluded because a missing nest-size measurement prevented calculation of food difference and investment. The analysis therefore included 84 trails joining 94 nests in ten colonies. No additional trails were excluded for missing or invalid measurements.
 
 **Trail presence and selection.** How does investment vary **among existing trails**? This conditions on trail presence. The hypothesised DAG shows selection paths, omitting other causes and any direct genetic effect on investment. $G$ is genetic differentiation, $H$ food difference, $T$ presence, $I$ investment and $U$ an unmeasured cause such as nest condition. Boxes indicate conditioning.
 
@@ -1040,43 +1095,43 @@ $\sigma_I$, shared across observations.
 The main model and the tighter genetic prior assessed below are specified here.
 
 ```{r m2b-specification}
-data_m2b <- apply_trail_scales(analysis_data$m2b, transformations)
-prior_m2b <- list(
+investment_data <- apply_trail_scales(analysis_data$m2b, trail_transformations)
+investment_prior_settings <- list(
   intercept = c(log(.003), 1.2), slope_sd = .25, genetic_sd = .5,
   food_sd = .15, group_sd = .5, colony_slope_sd = .3,
   residual_sd = .75, correlation = 2
 )
-data_m2b$response <- data_m2b$trail_investment
-stopifnot(all(is.finite(data_m2b$response) & data_m2b$response > 0))
+investment_data$response <- investment_data$trail_investment
+stopifnot(all(is.finite(investment_data$response) & investment_data$response > 0))
 
 # Positive investment among observed trails, with correlated colony
 # intercepts and additive distance slopes; nest effects are summed.
-formula_m2b <- bf(response ~ 0 + Intercept + distance_z + fst_z + food_z +
+investment_formula <- bf(response ~ 0 + Intercept + distance_z + fst_z + food_z +
   (1 + distance_z | colony) +
   (1 | mm(from_label, to_label, weights = cbind(w1, w2), scale = FALSE)))
-priors_m2b <- c(
-  set_prior(normal_prior(0, prior_m2b$slope_sd), class = "b"),
-  set_prior(normal_prior(prior_m2b$intercept[1], prior_m2b$intercept[2]),
+investment_priors <- c(
+  set_prior(normal_prior(0, investment_prior_settings$slope_sd), class = "b"),
+  set_prior(normal_prior(investment_prior_settings$intercept[1], investment_prior_settings$intercept[2]),
     class = "b", coef = "Intercept"),
-  set_prior(normal_prior(0, prior_m2b$group_sd), class = "sd"),
-  set_prior(sprintf("lkj(%g)", prior_m2b$correlation), class = "cor"),
-  set_prior(normal_prior(0, prior_m2b$colony_slope_sd), class = "sd", group = "colony", coef = "distance_z"),
-  set_prior(normal_prior(0, prior_m2b$genetic_sd), class = "b", coef = "fst_z"),
-  set_prior(normal_prior(0, prior_m2b$food_sd), class = "b", coef = "food_z"),
-  set_prior(normal_prior(0, prior_m2b$residual_sd), class = "sigma")
+  set_prior(normal_prior(0, investment_prior_settings$group_sd), class = "sd"),
+  set_prior(sprintf("lkj(%g)", investment_prior_settings$correlation), class = "cor"),
+  set_prior(normal_prior(0, investment_prior_settings$colony_slope_sd), class = "sd", group = "colony", coef = "distance_z"),
+  set_prior(normal_prior(0, investment_prior_settings$genetic_sd), class = "b", coef = "fst_z"),
+  set_prior(normal_prior(0, investment_prior_settings$food_sd), class = "b", coef = "food_z"),
+  set_prior(normal_prior(0, investment_prior_settings$residual_sd), class = "sigma")
 )
-specs$m2b <- list(
-  name = "m2b", formula = formula_m2b, data = data_m2b, prior = priors_m2b, prior_parameters = prior_m2b,
+model_specs$m2b <- list(
+  name = "m2b", formula = investment_formula, data = investment_data, prior = investment_priors, prior_parameters = investment_prior_settings,
   family = lognormal(), response_scale = "lognormal"
 )
 # The robustness check changes only the genetic slope prior.
-robustness_specs$m2b_tighter_genetic_prior <- specs$m2b
-robustness_specs$m2b_tighter_genetic_prior$name <- "m2b_tighter_genetic_prior"
-robustness_specs$m2b_tighter_genetic_prior$prior_parameters$genetic_sd <- .25
-robustness_specs$m2b_tighter_genetic_prior$prior$prior[
-  robustness_specs$m2b_tighter_genetic_prior$prior$coef == "fst_z"
+robustness_model_specs$m2b_tighter_genetic_prior <- model_specs$m2b
+robustness_model_specs$m2b_tighter_genetic_prior$name <- "m2b_tighter_genetic_prior"
+robustness_model_specs$m2b_tighter_genetic_prior$prior_parameters$genetic_sd <- .25
+robustness_model_specs$m2b_tighter_genetic_prior$prior$prior[
+  robustness_model_specs$m2b_tighter_genetic_prior$prior$coef == "fst_z"
 ] <- normal_prior(0, .25)
-specs$m2b$formula
+model_specs$m2b$formula
 ```
 
 ## Priors and prior predictions
@@ -1090,37 +1145,37 @@ food predictor. This is a plausibility check, not a hard bound on the index.
 # Expected-response curves: 100 draws, with group deviations set to zero.
 set.seed(seed + 704L)
 draws <- 100L
-d <- specs$m2b$data
-pr <- specs$m2b$prior_parameters
-a <- rnorm(draws, pr$intercept[1], pr$intercept[2])
-b <- cbind(rnorm(draws, 0, pr$slope_sd), rnorm(draws, 0, pr$genetic_sd),
-  rnorm(draws, 0, pr$food_sd))
+model_data <- model_specs$m2b$data
+prior_settings <- model_specs$m2b$prior_parameters
+intercept_draws <- rnorm(draws, prior_settings$intercept[1], prior_settings$intercept[2])
+coefficient_draws <- cbind(rnorm(draws, 0, prior_settings$slope_sd), rnorm(draws, 0, prior_settings$genetic_sd),
+  rnorm(draws, 0, prior_settings$food_sd))
 # Arithmetic-mean investment includes residual variation.
-sigma <- abs(rnorm(draws, 0, pr$residual_sd))
-variables <- c("distGeo_m", "FST_Latter", "food_difference")
-z <- as.matrix(d[, c("distance_z", "fst_z", "food_z")])
-prior_curves_m2b <- setNames(lapply(seq_along(variables), function(j) {
-  x <- seq(min(d[[variables[j]]]), max(d[[variables[j]]]), length.out = 80L)
-  scale <- transformations[match(variables[j], transformations$variable), ]
-  grid_z <- (x - scale$center) / scale$scale
-  other <- a + b[, -j, drop = FALSE] %*% t(z[, -j, drop = FALSE])
+residual_sd_draws <- abs(rnorm(draws, 0, prior_settings$residual_sd))
+variables <- c("distance_m", "FST_Latter", "food_difference")
+standardized_predictors <- as.matrix(model_data[, c("distance_z", "fst_z", "food_z")])
+investment_prior_curves <- setNames(lapply(seq_along(variables), function(j) {
+  x <- seq(min(model_data[[variables[j]]]), max(model_data[[variables[j]]]), length.out = 80L)
+  predictor_scaling <- trail_transformations[match(variables[j], trail_transformations$variable), ]
+  grid_z <- (x - predictor_scaling$center) / predictor_scaling$scale
+  other_predictor_contribution <- intercept_draws + coefficient_draws[, -j, drop = FALSE] %*% t(standardized_predictors[, -j, drop = FALSE])
   y <- vapply(grid_z, function(value) {
-    mu <- other + b[, j] * value
-    rowMeans(exp(mu + sigma^2 / 2))
+    linear_predictor_draws <- other_predictor_contribution + coefficient_draws[, j] * value
+    rowMeans(exp(linear_predictor_draws + residual_sd_draws^2 / 2))
   }, numeric(draws))
   long_prior_draws(x, y)
 }), variables)
-y_range <- range(d$response, unlist(lapply(prior_curves_m2b, `[[`, "y")))
+y_range <- range(model_data$response, unlist(lapply(investment_prior_curves, `[[`, "y")))
 panels <- lapply(seq_along(variables), function(j) {
   variable <- variables[j]
-  p <- ggplot(prior_curves_m2b[[j]], aes(x, y, group = draw)) +
+  plot <- ggplot(investment_prior_curves[[j]], aes(x, y, group = draw)) +
     geom_line(colour = "#0072B2", alpha = .2, linewidth = .22) +
-    geom_point(data = tibble(x = d[[variable]], y = d$response), aes(x, y),
+    geom_point(data = tibble(x = model_data[[variable]], y = model_data$response), aes(x, y),
       inherit.aes = FALSE, colour = "#222222", alpha = .4, size = .6)
-  style_prior_panel(p, variable, j, genetic = FALSE, investment = TRUE, y_range = y_range)
+  style_prior_panel(plot, variable, j, genetic = FALSE, investment = TRUE, y_range = y_range)
 })
-p <- arrange_panels(panels, width = 180, height = 94)
-save_figure("m2b_prior_trends", p, width = 180, height = 94)
+plot <- arrange_panels(panels, width = 180, height = 94)
+save_figure("m2b_prior_trends", plot, width = 180, height = 94)
 show_figure("m2b_prior_trends", paste0(
   "100 prior-drawn response curves per panel; points are observations for reference. ",
   "Group-specific deviations are zero. ",
@@ -1130,27 +1185,27 @@ show_figure("m2b_prior_trends", paste0(
 
 # Full prior predictions include shared group effects and observation noise.
 set.seed(seed + 23L)
-prior_sim_m2b <- simulate_prior(specs$m2b, draws = 4000L)
-yrep <- prior_sim_m2b$yrep
-prior_summary_m2b <- tibble(`Dataset median` = apply(yrep, 1, median),
-  `Dataset maximum` = apply(yrep, 1, max))
-pp <- prior_summary_m2b |> pivot_longer(everything(), names_to = "statistic", values_to = "value") |>
-  mutate(statistic = factor(statistic, levels = names(prior_summary_m2b)))
-p <- ggplot(pp, aes(value)) +
+investment_prior_simulation <- simulate_prior(model_specs$m2b, draws = 4000L)
+replicated_outcomes <- investment_prior_simulation$yrep
+investment_prior_summary <- tibble(`Dataset median` = apply(replicated_outcomes, 1, median),
+  `Dataset maximum` = apply(replicated_outcomes, 1, max))
+prior_summary_long <- investment_prior_summary |> pivot_longer(everything(), names_to = "statistic", values_to = "value") |>
+  mutate(statistic = factor(statistic, levels = names(investment_prior_summary)))
+plot <- ggplot(prior_summary_long, aes(value)) +
   geom_histogram(bins = 35, fill = "#0072B2", colour = "white", linewidth = .15) +
   facet_wrap(~statistic, scales = "free_x") +
   labs(x = "Trail investment (dimensionless; log scale)", y = "Simulations", title = model_label("m2b")) +
   scale_x_log10()
-save_figure("m2b_prior", p, width = 180, height = 80)
+save_figure("m2b_prior", plot, width = 180, height = 80)
 show_figure("m2b_prior", paste(4000,
-  "simulations include all group effects and response noise, using", nrow(prior_sim_m2b$data),
+  "simulations include all group effects and response noise, using", nrow(investment_prior_simulation$data),
   "evenly spaced design rows. Each value summarises one simulated dataset."))
-prior_tails_m2b <- tibble(
-  `Investment < 0.0001 (%)` = 100 * mean(yrep < .0001),
-  `Investment < 0.001 (%)` = 100 * mean(yrep < .001),
-  `Investment < 0.01 (%)` = 100 * mean(yrep < .01),
-  `Investment > 1 (%)` = 100 * mean(yrep > 1))
-show_table(prior_tails_m2b, digits = 2, caption = "Full prior predictions: weak and strong investment")
+investment_prior_tails <- tibble(
+  `Investment < 0.0001 (%)` = 100 * mean(replicated_outcomes < .0001),
+  `Investment < 0.001 (%)` = 100 * mean(replicated_outcomes < .001),
+  `Investment < 0.01 (%)` = 100 * mean(replicated_outcomes < .01),
+  `Investment > 1 (%)` = 100 * mean(replicated_outcomes > 1))
+show_table(investment_prior_tails, digits = 2, caption = "Full prior predictions: weak and strong investment")
 ```
 
 ### Genetic-effect prior
@@ -1166,12 +1221,12 @@ coefficient prior. Other coefficient, group-effect and response-noise draws
 are identical. The predictor design is retained; observed investment is unused.
 
 ```{r investment-genetic-prior-check}
-prior_width_specs <- list(`Genetic SD 0.25` = robustness_specs$m2b_tighter_genetic_prior,
-  `Genetic SD 0.50` = specs$m2b)
-prior_width_simulations <- map(prior_width_specs, function(s) {
+prior_width_specs <- list(`Genetic SD 0.25` = robustness_model_specs$m2b_tighter_genetic_prior,
+  `Genetic SD 0.50` = model_specs$m2b)
+prior_width_simulations <- map(prior_width_specs, function(model_spec) {
   # The same seed holds every other prior contribution fixed.
   set.seed(seed + 2L)
-  simulate_prior(s, draws = 40000L)
+  simulate_prior(model_spec, draws = 40000L)
 })
 prior_width_tails <- genetic_prior_tail_summary(prior_width_simulations)
 show_table(prior_width_tails, digits = 4, caption = "Prior tail probabilities (%): genetic prior alone")
@@ -1179,7 +1234,7 @@ show_table(prior_width_tails, digits = 4, caption = "Prior tail probabilities (%
 
 Both genetic priors allow weak investment while keeping values above one rare.
 Across the full FST range, the wider prior allows a broad 95% investment-ratio
-range (about 0.03–35). We retained $N(0,0.5)$ to allow substantial associations
+range (about 0.014–72). We retained $N(0,0.5)$ to allow substantial associations
 in either direction, independently of whether its posterior interval excludes
 zero; $N(0,0.25)$ remains a robustness check.
 
@@ -1190,23 +1245,23 @@ zero; $N(0,0.25)$ remains a robustness check.
 ```{r m2b-fit}
 sampling_dir <- tempfile("wood-ant-sampling-")
 dir.create(sampling_dir)
-fits$m2b <- brm(
-  formula = specs$m2b$formula, data = specs$m2b$data,
-  family = specs$m2b$family, prior = specs$m2b$prior,
+model_fits$m2b <- brm(
+  formula = model_specs$m2b$formula, data = model_specs$m2b$data,
+  family = model_specs$m2b$family, prior = model_specs$m2b$prior,
   backend = "cmdstanr", chains = 4, cores = 4,
-  iter = 3500L, warmup = 1500L, seed = seed, init = NULL,
+  iter = 3500L, warmup = 1500L, seed = 20261021L, init = NULL,
   control = list(adapt_delta = .995, max_treedepth = 13, metric = "diag_e"),
   save_pars = save_pars(all = TRUE), output_dir = sampling_dir,
   refresh = 200, silent = 1
 )
-fits$m2b <- refine_sampling_fit(fits$m2b, seed, sampling_dir)
+model_fits$m2b <- refine_sampling_fit(model_fits$m2b, 20261021L, sampling_dir)
 ```
 
 
 ```{r m2b-sampling}
-diagnostics_m2b <- diagnose_fit(fits$m2b, "m2b")
-show_table(diagnostics_m2b)
-stopifnot(all(diagnostics_m2b$pass))
+investment_diagnostics <- diagnose_fit(model_fits$m2b, "m2b")
+show_table(investment_diagnostics)
+stopifnot(all(investment_diagnostics$pass))
 ```
 
 ## Results {#investment-results}
@@ -1218,131 +1273,170 @@ among existing trails. Predictor units are the same as Model 2. Investment is
 dimensionless; zero indicates no local association.
 
 ```{r investment-results}
-d <- specs$m2b$data
-ids_results_m2b <- seq_len(ndraws(fits$m2b))
+model_data <- model_specs$m2b$data
+investment_result_draw_ids <- seq_len(ndraws(model_fits$m2b))
 ame_settings <- tibble(
-  variable = c("distGeo_m", "FST_Latter", "food_difference"),
-  unit = c(1, .01, .0001), step = c(.01, 1e-5, 1e-7),
+  variable = c("distance_m", "FST_Latter", "food_difference"),
+  unit = c(1, .01, .0001), derivative_step = c(.01, 1e-5, 1e-7),
   label = c("Distance (per m)", "FST (per 0.01)", "Food-income difference (per 0.0001/cm)")
 )
 # Local arithmetic-mean slopes retain all observed trails and fitted group effects.
-ame_draws_m2b <- lapply(seq_len(nrow(ame_settings)), function(j) {
-  local <- trail_local_slopes(fits$m2b, specs$m2b, transformations,
-    variable = ame_settings$variable[j], step = ame_settings$step[j], ids = ids_results_m2b)
+investment_marginal_effect_draws <- lapply(seq_len(nrow(ame_settings)), function(j) {
+  local_slopes <- trail_local_slopes(model_fits$m2b, model_specs$m2b, trail_transformations,
+    variable = ame_settings$variable[j], derivative_step = ame_settings$derivative_step[j], draw_ids = investment_result_draw_ids)
   # Investment per stated predictor unit, averaged within each posterior draw.
-  ame_settings$unit[j] * rowMeans(local)
+  ame_settings$unit[j] * rowMeans(local_slopes)
 })
-ame_draws_m2b <- do.call(cbind, ame_draws_m2b)
-colnames(ame_draws_m2b) <- ame_settings$variable
-effects_m2b <- list(estimates = bind_cols(
-  tibble(Predictor = ame_settings$label, Pairs = nrow(d)), summarize_columns(ame_draws_m2b)),
-  draws = ame_draws_m2b)
-show_trail_results(effects_m2b, presence = FALSE)
+investment_marginal_effect_draws <- do.call(cbind, investment_marginal_effect_draws)
+colnames(investment_marginal_effect_draws) <- ame_settings$variable
+investment_effects <- list(estimates = bind_cols(
+  tibble(Predictor = ame_settings$label, Pairs = nrow(model_data)), summarize_columns(investment_marginal_effect_draws)),
+  draws = investment_marginal_effect_draws)
+show_trail_results(investment_effects, presence = FALSE)
 ```
 
 
 ```{r investment-figures}
-d <- specs$m2b$data
-variables <- c("distGeo_m", "FST_Latter", "food_difference")
-ids_m2b <- unique(round(seq(1, ndraws(fits$m2b), length.out = min(2000, ndraws(fits$m2b)))))
-curves_m2b <- setNames(lapply(variables, function(variable) {
-  x <- d[[variable]]
+model_data <- model_specs$m2b$data
+variables <- c("distance_m", "FST_Latter", "food_difference")
+investment_curve_draw_ids <- unique(round(seq(1, ndraws(model_fits$m2b), length.out = min(2000, ndraws(model_fits$m2b)))))
+investment_curves <- setNames(lapply(variables, function(variable) {
+  x <- model_data[[variable]]
   values <- seq(min(x), max(x), length.out = 100)
   # Process ten grid values at a time, retaining every pair and its other predictors.
   batches <- split(seq_along(values), ceiling(seq_along(values) / 10))
   predictions <- lapply(batches, function(ix) {
-    newdata <- trail_prediction_data(d, transformations, variable, values[ix])
-    ep <- posterior_epred(fits$m2b, newdata = newdata,
-      re_formula = NA, draw_ids = ids_m2b)
+    newdata <- trail_prediction_data(model_data, trail_transformations, variable, values[ix])
+    expected_draws <- posterior_epred(model_fits$m2b, newdata = newdata,
+      re_formula = NA, draw_ids = investment_curve_draw_ids)
     vapply(seq_along(ix), function(j) {
-      rowMeans(ep[, (j - 1L) * nrow(d) + seq_len(nrow(d)), drop = FALSE])
-    }, numeric(nrow(ep)))
+      rowMeans(expected_draws[, (j - 1L) * nrow(model_data) + seq_len(nrow(model_data)), drop = FALSE])
+    }, numeric(nrow(expected_draws)))
   })
   bind_cols(tibble(x = values), summarize_columns(do.call(cbind, predictions)))
 }), variables)
-y_range <- range(d$response, unlist(lapply(curves_m2b, function(x) c(x$lower, x$upper))))
+y_range <- range(model_data$response, unlist(lapply(investment_curves, function(x) c(x$lower, x$upper))))
 stopifnot(all(is.finite(y_range)), all(y_range > 0))
 panels <- lapply(seq_along(variables), function(j) {
   variable <- variables[j]
-  p <- ggplot() +
-    geom_ribbon(data = curves_m2b[[variable]], aes(x, ymin = lower, ymax = upper),
+  plot <- ggplot() +
+    geom_ribbon(data = investment_curves[[variable]], aes(x, ymin = lower, ymax = upper),
       fill = "#0072B2", alpha = .16) +
-    geom_point(data = d, aes(x = .data[[variable]], y = response),
+    geom_point(data = model_data, aes(x = .data[[variable]], y = response),
       colour = "#555555", alpha = .45, size = .6) +
-    geom_line(data = curves_m2b[[variable]], aes(x, estimate), colour = "#0072B2", linewidth = .65)
-  style_trail_panel(p, variable, j, presence = FALSE, y_range = y_range)
+    geom_line(data = investment_curves[[variable]], aes(x, estimate), colour = "#0072B2", linewidth = .65)
+  style_trail_panel(plot, variable, j, presence = FALSE, y_range = y_range)
 })
-figure_m2b <- arrange_panels(panels, width = 180, height = 82)
-save_figure("m2b_effects", figure_m2b, width = 180, height = 82)
+investment_figure <- arrange_panels(panels, width = 180, height = 82)
+save_figure("m2b_effects", investment_figure, width = 180, height = 82)
 show_figure("m2b_effects", paste0(
-  "Points show all ", nrow(d), " observed pairs. Posterior prediction curves show ",
+  "Points show all ", nrow(model_data), " observed pairs. Posterior prediction curves show ",
   "arithmetic-mean investment with group-specific deviations set to zero, with posterior means and 95% credible intervals. ",
   "Other predictors retain their observed values, averaged over all analysed pairs within each draw. ",
   "Each curve stops at the observed predictor limits. ",
   "Investment uses a logarithmic vertical axis. ",
   "Food difference is shown in units of 0.0001 per centimetre."))
+
 ```
 
-**Interpretation.** Among existing trails, the average local genetic slope was −0.00174 investment units per 0.01 FST (95% credible interval −0.00400 to 0.00001). The genetic association remains tentative: the interval includes no association, as do the WC84 and tighter-prior checks. Distance and food associations were also uncertain. The logarithmic vertical axis displays the wide investment range; curves still show arithmetic means.
+**Interpretation.** Among existing trails, the average local genetic slope was −0.00156 investment units per 0.01 FST (95% credible interval −0.00354 to −0.00002). This suggests lower investment at greater genetic differentiation, although the magnitude remains uncertain. Both WC84 and tighter-prior intervals included no association. Distance and food associations were uncertain.
+
+### Additional food plot on log scale
+
+```{r investment-food-log-figure}
+# Display the same relationship over positive food differences on a log axis.
+positive_food <- filter(model_data, food_difference > 0)
+food_grid_log <- exp(seq(log(min(positive_food$food_difference)),
+  log(max(positive_food$food_difference)), length.out = 100))
+# Keep all analysed pairs when averaging predictions; only the displayed points exclude zeros.
+food_newdata_log <- trail_prediction_data(model_data, trail_transformations, "food_difference", food_grid_log)
+food_prediction_draws_log <- posterior_epred(model_fits$m2b, newdata = food_newdata_log,
+  re_formula = NA, draw_ids = investment_curve_draw_ids)
+food_means_log <- vapply(seq_along(food_grid_log), function(j) {
+  rowMeans(food_prediction_draws_log[, (j - 1L) * nrow(model_data) + seq_len(nrow(model_data)), drop = FALSE])
+}, numeric(length(investment_curve_draw_ids)))
+food_curve_log <- bind_cols(tibble(x = food_grid_log), summarize_columns(food_means_log))
+food_posterior_plot_log <- ggplot(food_curve_log, aes(x, estimate)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), fill = "#0072B2", alpha = .16) +
+  geom_point(data = positive_food, aes(x = food_difference, y = response),
+    inherit.aes = FALSE, colour = "#555555", alpha = .45, size = .8) +
+  geom_line(colour = "#0072B2", linewidth = .65) +
+  scale_x_log10(breaks = c(1e-6, 1e-5, 1e-4),
+    labels = function(x) scales::number(x * 1e4, accuracy = .01)) +
+  scale_y_log10(limits = y_range, labels = scales::label_number()) +
+  labs(title = "Additional food plot on log scale",
+    subtitle = paste("Display only: food difference is not logged in the model",
+      paste(sum(model_data$food_difference == 0), "zero differences omitted from this plot only"), sep = "\n"),
+    x = "Food-income difference (10⁻⁴ cm⁻¹; log₁₀ scale)",
+    y = "Trail investment (log₁₀ scale)")
+save_figure("m2b_posterior_food_log_axis", food_posterior_plot_log, width = 150, height = 105)
+show_figure("m2b_posterior_food_log_axis", paste0(
+  "Posterior mean and 95% credible interval over the observed positive food-difference range. ",
+  "Group-specific deviations are zero; other predictors are averaged over all ", nrow(model_data), " analysed pairs. ",
+  "Points show the ", nrow(positive_food), " trails with positive food differences."))
+```
+
+The horizontal axis is logarithmic for display only; food difference is not logged in the model. The 23 trails with zero food difference cannot appear on this axis but remain in the analysis and the original plot above. We have not used a log-plus-one transformation in the model because the arbitrary added constant can change the fitted relationship and inference ([Ekwaru and Veugelers, 2018](https://doi.org/10.1080/19466315.2017.1369900)).
 
 ## Posterior predictive checks
 
 ```{r m2b-posterior-predictive}
 set.seed(seed + 400L)
-d <- specs$m2b$data
-ids <- unique(round(seq(1, ndraws(fits$m2b), length.out = 400)))
-yr <- posterior_predict(fits$m2b, re_formula = NULL, draw_ids = ids)
-y <- d$response
-posterior_by_model$m2b <- posterior_predictive_summary(y, yr, "m2b",
+model_data <- model_specs$m2b$data
+draw_ids <- unique(round(seq(1, ndraws(model_fits$m2b), length.out = 400)))
+replicated_outcomes <- posterior_predict(model_fits$m2b, re_formula = NULL, draw_ids = draw_ids)
+observed_outcomes <- model_data$response
+predictive_checks$m2b <- posterior_predictive_summary(observed_outcomes, replicated_outcomes, "m2b",
   list(minimum = min, median = median, maximum = max, sd = sd))
-p <- bayesplot::ppc_dens_overlay(log(y), log(yr[1:60, , drop = FALSE])) +
+plot <- bayesplot::ppc_dens_overlay(log(observed_outcomes), log(replicated_outcomes[1:60, , drop = FALSE])) +
   labs(x = "Log trail investment", y = "Density")
-save_figure("m2b_ppc", p, width = 120, height = 85)
+save_figure("m2b_ppc", plot, width = 120, height = 85)
 show_figure("m2b_ppc", "Observed log investment (dark line) and posterior replications (light lines).")
 strata <- list(
-  colony = as.character(d$colony),
-  distance = paste("Distance quartile", dplyr::ntile(d$distGeo_m, 4))
+  colony = as.character(model_data$colony),
+  distance = paste("Distance quartile", dplyr::ntile(model_data$distance_m, 4))
 )
-show_table(posterior_group_checks(y, yr, strata),
+show_table(posterior_group_checks(observed_outcomes, replicated_outcomes, strata),
   caption = "Posterior predictive checks of group means")
-show_table(posterior_by_model$m2b, digits = 4)
+show_table(predictive_checks$m2b, digits = 4)
 ```
 
 All four overall summaries and 14 colony/distance means fall within their
 95% predictive ranges.
+
 
 ## Robustness checks: FST estimator and genetic prior
 
 We replace Latter FST with WC84, retaining the main-model predictor scaling, and separately tighten only the genetic-effect prior to Normal(0, 0.25).
 
 ```{r investment-robustness}
-robustness_specs$m2b_WC84 <- specs$m2b
-robustness_specs$m2b_WC84$name <- "m2b_WC84"
-robustness_specs$m2b_WC84$data <- apply_trail_scales(
-  analysis_data$m2b, transformations, "FST_WC84")
-robustness_specs$m2b_WC84$data$response <- robustness_specs$m2b_WC84$data$trail_investment
-for (nm in c("m2b_WC84", "m2b_tighter_genetic_prior")) {
+robustness_model_specs$m2b_WC84 <- model_specs$m2b
+robustness_model_specs$m2b_WC84$name <- "m2b_WC84"
+robustness_model_specs$m2b_WC84$data <- apply_trail_scales(
+  analysis_data$m2b, trail_transformations, "FST_WC84")
+robustness_model_specs$m2b_WC84$data$response <- robustness_model_specs$m2b_WC84$data$trail_investment
+for (model_name in c("m2b_WC84", "m2b_tighter_genetic_prior")) {
   sampling_dir <- tempfile("wood-ant-sampling-")
   dir.create(sampling_dir)
-  robustness_fits[[nm]] <- brm(
-    formula = robustness_specs[[nm]]$formula, data = robustness_specs[[nm]]$data,
-    family = robustness_specs[[nm]]$family, prior = robustness_specs[[nm]]$prior,
+  robustness_fits[[model_name]] <- brm(
+    formula = robustness_model_specs[[model_name]]$formula, data = robustness_model_specs[[model_name]]$data,
+    family = robustness_model_specs[[model_name]]$family, prior = robustness_model_specs[[model_name]]$prior,
     backend = "cmdstanr", chains = 4, cores = 4,
     iter = 3500L, warmup = 1500L, seed = seed, init = NULL,
     control = list(adapt_delta = .995, max_treedepth = 13, metric = "diag_e"),
     save_pars = save_pars(all = TRUE), output_dir = sampling_dir,
     refresh = 200, silent = 1
   )
-  robustness_fits[[nm]] <- refine_sampling_fit(robustness_fits[[nm]], seed, sampling_dir)
-  diagnostics_robustness <- diagnose_fit(robustness_fits[[nm]], nm)
+  robustness_fits[[model_name]] <- refine_sampling_fit(robustness_fits[[model_name]], seed, sampling_dir)
+  diagnostics_robustness <- diagnose_fit(robustness_fits[[model_name]], model_name)
   show_table(diagnostics_robustness)
   stopifnot(all(diagnostics_robustness$pass))
 }
 investment_robustness <- c("m2b_WC84", "m2b_tighter_genetic_prior")
 show_genetic_robustness(
-  c(fits["m2b"], robustness_fits[investment_robustness]),
-  c(specs["m2b"], robustness_specs[investment_robustness]), transformations)
+  c(model_fits["m2b"], robustness_fits[investment_robustness]),
+  c(model_specs["m2b"], robustness_model_specs[investment_robustness]), trail_transformations)
 ```
 
-The genetic association was negative on average under all three specifications,
-but each interval included no association. Its magnitude and direction remain uncertain.
+The genetic association was negative on average under all three specifications. The main interval ended just below zero, while both WC84 and tighter-prior intervals included zero; the magnitude remains uncertain.
+
